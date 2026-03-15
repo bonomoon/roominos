@@ -1,0 +1,52 @@
+/* Task 002: Cursor-based batch processing
+ * Iterates over all active users and calculates total balance
+ */
+
+#include <stdio.h>
+
+EXEC SQL INCLUDE sqlca;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    int    emp_id;
+    char   emp_name[51];
+    double emp_salary;
+    double total_salary;
+    int    emp_count;
+EXEC SQL END DECLARE SECTION;
+
+void calculate_department_stats(int dept_id) {
+    total_salary = 0.0;
+    emp_count = 0;
+
+    EXEC SQL DECLARE emp_cursor CURSOR FOR
+        SELECT EMP_ID, EMP_NAME, SALARY
+        FROM EMPLOYEES
+        WHERE DEPT_ID = :dept_id AND STATUS = 'ACTIVE'
+        ORDER BY EMP_NAME;
+
+    EXEC SQL OPEN emp_cursor;
+
+    EXEC SQL WHENEVER NOT FOUND GOTO done_loop;
+
+    for (;;) {
+        EXEC SQL FETCH emp_cursor
+            INTO :emp_id, :emp_name, :emp_salary;
+
+        total_salary += emp_salary;
+        emp_count++;
+        printf("  %d: %s - %.2f\n", emp_id, emp_name, emp_salary);
+    }
+
+done_loop:
+    EXEC SQL CLOSE emp_cursor;
+
+    printf("Department %d: %d employees, total salary: %.2f\n",
+           dept_id, emp_count, total_salary);
+}
+
+int main() {
+    EXEC SQL CONNECT :username IDENTIFIED BY :password;
+    calculate_department_stats(10);
+    EXEC SQL COMMIT WORK RELEASE;
+    return 0;
+}

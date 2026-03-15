@@ -1,0 +1,28 @@
+{
+  "id": "spring_002",
+  "title": "Dynamic Search with QueryDSL",
+  "difficulty": "medium",
+  "tech_stack": ["Spring Boot 3", "QueryDSL JPA", "Oracle", "Maven", "JUnit 5"],
+  "description": "Add dynamic search capabilities to an existing Product API using QueryDSL. Support filtering by multiple optional criteria (name contains, price range, category, date range) with pagination.",
+  "requirements": {
+    "search_criteria": [
+      "name (contains, case-insensitive)",
+      "minPrice / maxPrice (range)",
+      "category (exact match)",
+      "createdAfter / createdBefore (date range)"
+    ],
+    "features": [
+      "All criteria are optional (dynamic WHERE clause)",
+      "BooleanBuilder for query composition",
+      "DTO projection (not full entity)",
+      "Pagination support",
+      "Sort by any field"
+    ]
+  },
+  "measurement": {
+    "query_correctness": "All filter combinations produce correct results",
+    "performance": "Single query (no N+1), DTO projection used",
+    "flexibility": "Adding new filter requires only 2-3 lines of code",
+    "testing": "Tests cover each filter individually and in combination"
+  }
+}

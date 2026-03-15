@@ -1,0 +1,50 @@
+/* Task 001: Simple SELECT INTO
+ * Retrieves a user record by ID from Oracle
+ */
+
+#include <stdio.h>
+#include <string.h>
+
+EXEC SQL INCLUDE sqlca;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    int    user_id;
+    char   user_name[51];
+    char   user_email[101];
+    double user_balance;
+    short  user_balance_ind;  /* indicator variable for NULL */
+EXEC SQL END DECLARE SECTION;
+
+void get_user(int id) {
+    user_id = id;
+
+    EXEC SQL SELECT USER_NAME, USER_EMAIL, BALANCE
+        INTO :user_name, :user_email, :user_balance:user_balance_ind
+        FROM USERS
+        WHERE USER_ID = :user_id;
+
+    if (sqlca.sqlcode == 0) {
+        printf("Name: %s\n", user_name);
+        printf("Email: %s\n", user_email);
+        if (user_balance_ind == -1) {
+            printf("Balance: NULL\n");
+        } else {
+            printf("Balance: %.2f\n", user_balance);
+        }
+    } else if (sqlca.sqlcode == 1403) {
+        printf("User not found: %d\n", id);
+    } else {
+        printf("SQL Error: %d\n", sqlca.sqlcode);
+    }
+}
+
+int main(int argc, char *argv[]) {
+    EXEC SQL CONNECT :username IDENTIFIED BY :password;
+
+    if (argc > 1) {
+        get_user(atoi(argv[1]));
+    }
+
+    EXEC SQL COMMIT WORK RELEASE;
+    return 0;
+}

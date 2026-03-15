@@ -1,0 +1,13 @@
+{
+  "id": "task_001",
+  "title": "Simple SELECT INTO Migration",
+  "difficulty": "easy",
+  "constructs": ["SELECT INTO", "host variables", "indicator variables", "sqlca.sqlcode"],
+  "expected_java_patterns": ["@Entity", "@Repository", "Optional<User>", "BigDecimal for balance"],
+  "measurement": {
+    "sql_equivalence": "SELECT statement produces same result",
+    "null_handling": "Indicator variable -1 maps to Optional.empty() or null",
+    "error_handling": "sqlcode 1403 maps to EntityNotFoundException or Optional.empty()",
+    "data_types": "double balance → BigDecimal"
+  }
+}

@@ -1,0 +1,68 @@
+/* Task 003: Complex error handling with savepoints
+ * Transfers funds between accounts with rollback on failure
+ */
+
+#include <stdio.h>
+
+EXEC SQL INCLUDE sqlca;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    int    from_acct;
+    int    to_acct;
+    double amount;
+    double from_balance;
+    double to_balance;
+EXEC SQL END DECLARE SECTION;
+
+int transfer_funds(int from, int to, double amt) {
+    from_acct = from;
+    to_acct = to;
+    amount = amt;
+
+    EXEC SQL WHENEVER SQLERROR GOTO error_handler;
+
+    /* Check source balance */
+    EXEC SQL SELECT BALANCE INTO :from_balance
+        FROM ACCOUNTS WHERE ACCT_ID = :from_acct
+        FOR UPDATE;
+
+    if (from_balance < amount) {
+        printf("Insufficient funds: %.2f < %.2f\n", from_balance, amount);
+        return -1;
+    }
+
+    EXEC SQL SAVEPOINT before_transfer;
+
+    /* Debit source */
+    EXEC SQL UPDATE ACCOUNTS
+        SET BALANCE = BALANCE - :amount,
+            LAST_UPDATED = SYSDATE
+        WHERE ACCT_ID = :from_acct;
+
+    /* Credit destination */
+    EXEC SQL UPDATE ACCOUNTS
+        SET BALANCE = BALANCE + :amount,
+            LAST_UPDATED = SYSDATE
+        WHERE ACCT_ID = :to_acct;
+
+    /* Log the transfer */
+    EXEC SQL INSERT INTO TRANSFER_LOG
+        (FROM_ACCT, TO_ACCT, AMOUNT, TRANSFER_DATE)
+        VALUES (:from_acct, :to_acct, :amount, SYSDATE);
+
+    EXEC SQL COMMIT WORK;
+    printf("Transfer successful: %.2f from %d to %d\n", amount, from, to);
+    return 0;
+
+error_handler:
+    printf("SQL Error %d: %s\n", sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+    EXEC SQL ROLLBACK TO SAVEPOINT before_transfer;
+    return -2;
+}
+
+int main() {
+    EXEC SQL CONNECT :username IDENTIFIED BY :password;
+    transfer_funds(1001, 1002, 500.00);
+    EXEC SQL COMMIT WORK RELEASE;
+    return 0;
+}

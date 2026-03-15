@@ -1,0 +1,60 @@
+name: Migration-Aware Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Claude Code Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          direct_prompt: |
+            Review this PR with focus on the following areas:
+
+            ## General Code Quality
+            - SOLID principles adherence
+            - Error handling completeness
+            - Security vulnerabilities (OWASP Top 10)
+
+            ## Java/Spring Specific
+            - JPA entity conventions (FetchType.LAZY, @EntityGraph for N+1)
+            - Transaction boundary correctness (@Transactional scope)
+            - Oracle data type mapping (NUMBER -> BigDecimal, DATE -> LocalDateTime)
+            - QueryDSL usage patterns
+            - JDK version compatibility (8/17/21)
+
+            ## Pro*C -> Java Migration (if applicable)
+            - SQL statement equivalence (EXEC SQL -> JPA/JDBC)
+            - Data type fidelity (COMP-3 -> BigDecimal precision/scale)
+            - Transaction parity (COMMIT WORK -> @Transactional boundaries)
+            - Error handling parity (WHENEVER SQLERROR -> exception handling)
+            - Cursor management (DECLARE/OPEN/FETCH/CLOSE -> ResultSet/Stream lifecycle)
+            - NULL indicator variable handling
+
+            ## Output Format
+            For each finding, provide:
+            - Severity: CRITICAL / WARNING / INFO
+            - File and line reference
+            - Description and suggested fix
+
+  yaml-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate YAML files
+        run: |
+          pip install yamllint
+          yamllint -d relaxed .github/workflows/

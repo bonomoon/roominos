@@ -1,0 +1,14 @@
+{
+  "id": "task_003",
+  "title": "Complex Error Handling with Savepoints",
+  "difficulty": "hard",
+  "constructs": ["WHENEVER SQLERROR", "SAVEPOINT", "ROLLBACK TO SAVEPOINT", "FOR UPDATE", "SYSDATE", "multi-table transaction"],
+  "expected_java_patterns": ["@Transactional", "pessimistic lock", "TransactionTemplate", "custom exception hierarchy", "audit logging"],
+  "measurement": {
+    "locking": "FOR UPDATE maps to @Lock(PESSIMISTIC_WRITE)",
+    "savepoint": "SAVEPOINT maps to TransactionTemplate or nested transaction",
+    "rollback": "Partial rollback preserves prior state",
+    "error_propagation": "SQLERROR maps to specific exception types",
+    "atomicity": "Transfer is all-or-nothing"
+  }
+}

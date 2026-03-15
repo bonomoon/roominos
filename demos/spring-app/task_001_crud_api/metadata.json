@@ -1,0 +1,30 @@
+{
+  "id": "spring_001",
+  "title": "CRUD REST API with Oracle",
+  "difficulty": "easy",
+  "tech_stack": ["Spring Boot 3", "Spring Data JPA", "Oracle", "Maven", "JUnit 5", "Lombok"],
+  "description": "Build a complete CRUD REST API for a Product management system. Products have: id, name, description, price (BigDecimal), category, createdAt, updatedAt. Include full test coverage with Testcontainers + Oracle.",
+  "requirements": {
+    "entities": ["Product"],
+    "endpoints": [
+      "GET /api/v1/products - list with pagination",
+      "GET /api/v1/products/{id} - get by id",
+      "POST /api/v1/products - create",
+      "PUT /api/v1/products/{id} - update",
+      "DELETE /api/v1/products/{id} - delete"
+    ],
+    "features": [
+      "Pagination and sorting",
+      "Input validation (@Valid)",
+      "Global exception handling",
+      "Oracle sequence for ID generation",
+      "Audit fields (createdAt, updatedAt via @PrePersist, @PreUpdate)"
+    ]
+  },
+  "measurement": {
+    "completeness": "All 5 endpoints working",
+    "conventions": "Layered architecture (Entity/Repository/Service/Controller/DTO)",
+    "testing": "Repository + Service + Controller tests with Testcontainers",
+    "oracle_specific": "Sequence-based ID, correct data type mapping"
+  }
+}

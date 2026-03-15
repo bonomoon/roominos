@@ -1,0 +1,29 @@
+{
+  "id": "spring_003",
+  "title": "Batch Processing with Spring Batch + JDBC",
+  "difficulty": "hard",
+  "tech_stack": ["Spring Boot 3", "Spring Batch", "JdbcTemplate", "Oracle", "Maven", "JUnit 5"],
+  "description": "Build a batch processing pipeline that reads transactions from a CSV file, validates them, enriches with account data from Oracle, and writes results using JDBC batch insert. Include skip/retry logic for resilience.",
+  "requirements": {
+    "pipeline": [
+      "ItemReader: FlatFileItemReader for CSV",
+      "ItemProcessor: Validate + enrich from Oracle (JdbcTemplate lookup)",
+      "ItemWriter: JdbcBatchItemWriter for bulk insert to PROCESSED_TRANSACTIONS table"
+    ],
+    "features": [
+      "Chunk-oriented processing (chunk size configurable)",
+      "Skip policy: skip invalid records (max 10)",
+      "Retry policy: retry DB errors (max 3)",
+      "Job parameters: input file path, processing date",
+      "Oracle stored procedure call for post-processing summary",
+      "Job execution metadata in Oracle (Spring Batch tables)"
+    ]
+  },
+  "measurement": {
+    "correctness": "All valid records processed, invalid skipped",
+    "performance": "JDBC batch insert used (not row-by-row)",
+    "resilience": "Skipped records logged, retries work",
+    "oracle_integration": "Stored procedure called, batch tables created",
+    "testing": "End-to-end test with embedded DB or Testcontainers"
+  }
+}

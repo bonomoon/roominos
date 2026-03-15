@@ -1,0 +1,13 @@
+{
+  "id": "task_002",
+  "title": "Cursor-based Batch Processing Migration",
+  "difficulty": "medium",
+  "constructs": ["DECLARE CURSOR", "OPEN", "FETCH", "CLOSE", "WHENEVER NOT FOUND", "aggregation"],
+  "expected_java_patterns": ["List<Employee>", "Stream", "@Query with JPQL", "BigDecimal sum", "Collectors"],
+  "measurement": {
+    "cursor_mapping": "Cursor loop maps to List/Stream iteration",
+    "aggregation": "Sum computed identically (BigDecimal precision)",
+    "ordering": "ORDER BY preserved in query",
+    "resource_management": "Cursor CLOSE maps to Stream.close() or automatic"
+  }
+}
