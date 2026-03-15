@@ -50,9 +50,82 @@ class Config:
     user_email: str = ""
     timeout: int = 60
     max_tools: int = 8
+    log_dir: str = ""  # empty = no file logging
 
 
 config = Config()
+
+# ---------------------------------------------------------------------------
+# Request/Response file logging
+# ---------------------------------------------------------------------------
+
+_request_counter = 0
+
+
+def log_to_file(req_body: dict, resp_body: dict, attempt: int, was_repaired: bool, error: str | None = None) -> str | None:
+    """Save request + response pair to a JSON file for analysis."""
+    if not config.log_dir:
+        return None
+
+    global _request_counter
+    _request_counter += 1
+
+    os.makedirs(config.log_dir, exist_ok=True)
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_request_counter:04d}.json"
+    filepath = os.path.join(config.log_dir, filename)
+
+    # Extract key info for analysis
+    messages = req_body.get("messages", [])
+    tools_sent = len(req_body.get("tools", []))
+    tool_names_sent = [t.get("function", {}).get("name", "") for t in req_body.get("tools", []) if t.get("type") == "function"]
+
+    # Calculate approximate token count (rough: 4 chars ≈ 1 token)
+    req_text = json.dumps(req_body)
+    approx_input_tokens = len(req_text) // 4
+
+    # Extract response info
+    resp_detail = {}
+    for choice in resp_body.get("choices", []):
+        msg = choice.get("message", {})
+        tc = msg.get("tool_calls", [])
+        if tc:
+            resp_detail["tool_calls"] = [
+                {"name": t.get("function", {}).get("name"), "arguments": t.get("function", {}).get("arguments", "")[:200]}
+                for t in tc
+            ]
+        if msg.get("content"):
+            resp_detail["content_length"] = len(msg["content"])
+            resp_detail["content_preview"] = msg["content"][:200]
+
+    usage = resp_body.get("usage", {})
+
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "sequence": _request_counter,
+        "model": req_body.get("model", ""),
+        "attempt": attempt,
+        "was_repaired": was_repaired,
+        "error": error,
+        "request": {
+            "message_count": len(messages),
+            "last_user_message": next((m.get("content", "")[:300] for m in reversed(messages) if m.get("role") == "user"), ""),
+            "tools_count": tools_sent,
+            "tool_names": tool_names_sent,
+            "approx_input_tokens": approx_input_tokens,
+        },
+        "response": {
+            **resp_detail,
+            "usage": usage,
+            "finish_reason": resp_body.get("choices", [{}])[0].get("finish_reason"),
+        },
+        "success": bool(resp_detail.get("tool_calls") or resp_detail.get("content_length")),
+    }
+
+    with open(filepath, "w") as f:
+        json.dump(log_entry, f, indent=2, ensure_ascii=False)
+
+    logger.info(f"[{_ts()}] 📝 logged → {filename}")
+    return filepath
 
 # ---------------------------------------------------------------------------
 # JSON repair utilities
@@ -195,6 +268,98 @@ def simplify_tools(tools: list[dict], max_tools: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Context window monitoring
+# ---------------------------------------------------------------------------
+
+def estimate_tokens(obj: Any) -> int:
+    """Rough token estimate: 4 chars ≈ 1 token."""
+    return len(json.dumps(obj, ensure_ascii=False)) // 4
+
+
+def check_context_budget(req_body: dict, warn_threshold: float = 0.4, max_context: int = 80000) -> dict | None:
+    """
+    Check if request is approaching the context budget.
+    Returns a warning dict if over threshold, None if OK.
+    Dex Horthy rule: context degrades at 40% of window.
+    """
+    total_tokens = estimate_tokens(req_body)
+    budget = int(max_context * warn_threshold)
+
+    if total_tokens > budget:
+        usage_pct = total_tokens / max_context * 100
+        return {
+            "approx_tokens": total_tokens,
+            "budget": budget,
+            "max_context": max_context,
+            "usage_percent": round(usage_pct, 1),
+            "warning": f"Context at {usage_pct:.0f}% ({total_tokens}/{max_context} tokens). "
+                       f"Quality may degrade. Consider /clear to reset context."
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
+# System prompt compression
+# ---------------------------------------------------------------------------
+
+def compress_system_messages(messages: list[dict]) -> list[dict]:
+    """
+    Compress verbose system messages to save context budget.
+    Targets Roo Code's environment_details and tool reminders.
+    """
+    compressed = []
+    for msg in messages:
+        if msg.get("role") != "system" and msg.get("role") != "user":
+            compressed.append(msg)
+            continue
+
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            compressed.append(msg)
+            continue
+
+        original_len = len(content)
+
+        # Remove verbose environment_details blocks (VSCode file listings)
+        if "<environment_details>" in content:
+            # Keep only essential parts, remove file tree
+            import re as _re
+            content = _re.sub(
+                r'# Current Workspace Directory.*?(?=# Current Time|# Current Mode|</environment_details>)',
+                '# Workspace: (file listing compressed by Forge)\n',
+                content,
+                flags=_re.DOTALL
+            )
+            # Remove VSCode visible files / open tabs
+            content = _re.sub(
+                r'# VSCode Visible Files.*?(?=# Current|</environment_details>)',
+                '',
+                content,
+                flags=_re.DOTALL
+            )
+
+        # Remove repetitive todo reminders after first occurrence
+        if "REMINDERS" in content and "update_todo_list" in content:
+            # Keep only the table, remove the verbose instructions
+            content = _re.sub(
+                r'IMPORTANT: When task status changes.*?$',
+                '',
+                content,
+                flags=_re.DOTALL | _re.MULTILINE
+            )
+
+        new_msg = dict(msg)
+        new_msg["content"] = content
+
+        saved = original_len - len(content)
+        if saved > 100:
+            logger.info(f"[{_ts()}] ✂ compressed system msg: saved {saved} chars (~{saved//4} tokens)")
+
+        compressed.append(new_msg)
+    return compressed
+
+
+# ---------------------------------------------------------------------------
 # Response repair
 # ---------------------------------------------------------------------------
 
@@ -226,6 +391,24 @@ def repair_response(body: dict) -> tuple[dict, bool]:
             msg["tool_calls"] = fixed_calls
             choice["message"] = msg
     return body, repaired
+
+
+def normalize_reasoning_response(body: dict) -> dict:
+    """Some models put output in 'reasoning' instead of 'content'. Normalize."""
+    for choice in body.get("choices", []):
+        msg = choice.get("message", {})
+        if not msg.get("content") and not msg.get("tool_calls"):
+            # Check for reasoning field (OpenRouter gpt-oss pattern)
+            reasoning = msg.get("reasoning")
+            if reasoning and isinstance(reasoning, str):
+                msg["content"] = reasoning
+            elif msg.get("reasoning_details"):
+                # Extract text from reasoning_details array
+                texts = [d.get("text", "") for d in msg["reasoning_details"] if isinstance(d, dict)]
+                combined = "\n".join(t for t in texts if t)
+                if combined:
+                    msg["content"] = combined
+    return body
 
 
 def response_has_content(body: dict) -> bool:
@@ -267,7 +450,11 @@ async def forward_request(
     body: bytes | None,
     timeout: int,
 ) -> httpx.Response:
-    url = config.target.rstrip("/") + path
+    # Strip /v1 prefix from path if target already ends with /v1
+    target = config.target.rstrip("/")
+    if target.endswith("/v1") and path.startswith("/v1"):
+        path = path[3:]  # remove leading /v1
+    url = target + path
     async with httpx.AsyncClient(timeout=timeout) as client:
         return await client.request(
             method=method,
@@ -331,9 +518,77 @@ async def proxy_chat_completions(request: Request) -> Response:
     if tools:
         req_body["tools"] = simplify_tools(tools, config.max_tools)
 
+    # Compress system messages to save context budget
+    if "messages" in req_body:
+        req_body["messages"] = compress_system_messages(req_body["messages"])
+
+    # Check context budget
+    budget_warning = check_context_budget(req_body)
+    if budget_warning:
+        logger.warning(f"[{_ts()}] ⚠ {budget_warning['warning']}")
+
     log_request(request.method, "/v1/chat/completions", len(req_body.get("tools", [])))
 
     headers = build_upstream_headers(request)
+
+    # Streaming: passthrough directly (no JSON repair possible on SSE)
+    if req_body.get("stream"):
+        from starlette.responses import StreamingResponse
+
+        target_url = config.target.rstrip("/")
+        path = "/chat/completions" if target_url.endswith("/v1") else "/v1/chat/completions"
+
+        def transform_sse_chunk(raw: bytes) -> bytes:
+            """Rewrite reasoning → content in SSE stream chunks."""
+            lines = raw.split(b"\n")
+            out_lines = []
+            for line in lines:
+                if line.startswith(b"data: ") and not line.startswith(b"data: [DONE]"):
+                    try:
+                        payload = json.loads(line[6:])
+                        for choice in payload.get("choices", []):
+                            delta = choice.get("delta", {})
+                            # Move reasoning to content if content is empty
+                            content = delta.get("content")
+                            reasoning = delta.get("reasoning")
+                            if (not content or content == "") and reasoning:
+                                delta["content"] = reasoning
+                            # Also handle reasoning_details
+                            if (not delta.get("content")) and delta.get("reasoning_details"):
+                                texts = [d.get("text", "") for d in delta["reasoning_details"] if isinstance(d, dict)]
+                                combined = "".join(texts)
+                                if combined:
+                                    delta["content"] = combined
+                        out_lines.append(b"data: " + json.dumps(payload).encode())
+                    except (json.JSONDecodeError, TypeError):
+                        out_lines.append(line)
+                else:
+                    out_lines.append(line)
+            return b"\n".join(out_lines)
+
+        async def stream_generator():
+            client = httpx.AsyncClient(timeout=config.timeout)
+            try:
+                req = client.build_request(
+                    "POST",
+                    target_url + path,
+                    headers=headers,
+                    content=json.dumps(req_body).encode(),
+                )
+                resp = await client.send(req, stream=True)
+                async for chunk in resp.aiter_bytes():
+                    yield transform_sse_chunk(chunk)
+                await resp.aclose()
+            except httpx.TimeoutException:
+                yield b'data: {"error":"upstream timeout"}\n\n'
+            finally:
+                await client.aclose()
+
+        log_response(200, "stream passthrough")
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+        )
 
     max_retries = 2
     backoff = 1.0
@@ -363,7 +618,9 @@ async def proxy_chat_completions(request: Request) -> Response:
         try:
             resp_body: dict = json.loads(resp.content)
         except json.JSONDecodeError:
-            repaired, ok = repair_json(resp.content.decode(errors="replace"))
+            raw_text = resp.content.decode(errors="replace")
+            logger.warning(f"[{_ts()}] ⚠ Raw response (first 500 chars): {raw_text[:500]}")
+            repaired, ok = repair_json(raw_text)
             if ok and repaired is not None:
                 resp_body = repaired
             else:
@@ -379,6 +636,9 @@ async def proxy_chat_completions(request: Request) -> Response:
                 log_response(500, "unfixable JSON")
                 return JSONResponse({"error": "unfixable upstream JSON"}, status_code=500)
 
+        # Normalize reasoning-only responses
+        resp_body = normalize_reasoning_response(resp_body)
+
         # Repair tool_calls JSON
         resp_body, was_repaired = repair_response(resp_body)
 
@@ -391,15 +651,18 @@ async def proxy_chat_completions(request: Request) -> Response:
                 continue
             # Last attempt: return as-is
             log_response(200, "empty (exhausted retries)")
+            log_to_file(req_body, resp_body, attempt=attempt, was_repaired=False, error="empty response")
             return JSONResponse(resp_body)
 
         detail = extract_response_detail(resp_body)
         if was_repaired:
             detail += " [repaired]"
         log_response(200, detail)
+        log_to_file(req_body, resp_body, attempt=attempt, was_repaired=was_repaired)
         return JSONResponse(resp_body)
 
     # Should not reach here
+    log_to_file(req_body, {}, attempt=max_retries, was_repaired=False, error="max retries exceeded")
     return JSONResponse({"error": "max retries exceeded"}, status_code=502)
 
 
@@ -442,6 +705,11 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("FORGE_HOST", "127.0.0.1"),
         help="Host to bind to (default: 127.0.0.1)",
     )
+    parser.add_argument(
+        "--log-dir",
+        default=os.environ.get("FORGE_LOG_DIR", ""),
+        help="Directory to save request/response logs (default: disabled)",
+    )
     return parser.parse_args()
 
 
@@ -455,6 +723,7 @@ if __name__ == "__main__":
     config.timeout = args.timeout
     config.max_tools = args.max_tools
     config.host = args.host
+    config.log_dir = args.log_dir
 
     if args.header:
         if ":" in args.header:

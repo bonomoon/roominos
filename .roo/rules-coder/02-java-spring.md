@@ -7,6 +7,55 @@
 - **NEVER use `javax.persistence`** with Spring Boot 3.x — use `jakarta.persistence` instead (Jakarta EE migration).
 - **Always create `application-test.yml`** (or `application-test.properties`) with H2 datasource for tests. Tests must not depend on Oracle being available.
 - **Always include a null/edge case test** when the Pro*C source uses indicator variables (e.g., `balance_ind == -1` → test that null balance is handled).
+- **ALWAYS create test classes** — every Service must have a corresponding test. No migration is complete without tests.
+
+## MANDATORY: Test Generation
+
+Every migration MUST include test files. No exceptions.
+
+### Required Tests per Layer
+- **ServiceTest** (always): `src/test/java/.../service/XxxServiceTest.java`
+  - Use `@SpringBootTest` with `@ActiveProfiles("test")`
+  - Test all scenarios from the Pro*C source (success, not-found, null values, error cases)
+  - Use H2 in-memory database (via application-test.yml)
+
+### Test Template
+```java
+@SpringBootTest
+@ActiveProfiles("test")
+class XxxServiceTest {
+    @Autowired
+    private XxxService service;
+    @Autowired
+    private XxxRepository repository;
+
+    @BeforeEach
+    void setUp() { repository.deleteAll(); }
+
+    @Test
+    void should_returnResult_when_dataExists() { ... }
+
+    @Test
+    void should_throwOrReturnEmpty_when_notFound() { ... }
+
+    @Test
+    void should_handleNull_when_indicatorIsNegative() { ... }
+}
+```
+
+### application-test.yml (MUST create)
+```yaml
+spring:
+  datasource:
+    url: jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: true
+```
 
 ## Architecture Layers
 
