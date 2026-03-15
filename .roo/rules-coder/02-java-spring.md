@@ -1,5 +1,13 @@
 # Java / Spring Development Rules
 
+## CRITICAL: Common Mistakes to Avoid
+
+- **NEVER use `org.hibernate.dialect.Oracle12cDialect`** — removed in Hibernate 6 (Spring Boot 3.x). Let Hibernate auto-detect the dialect, or omit the `dialect` property entirely.
+- **NEVER use `GenerationType.IDENTITY` with Oracle** — Oracle does not support IDENTITY columns. Always use `GenerationType.SEQUENCE` + `@SequenceGenerator`.
+- **NEVER use `javax.persistence`** with Spring Boot 3.x — use `jakarta.persistence` instead (Jakarta EE migration).
+- **Always create `application-test.yml`** (or `application-test.properties`) with H2 datasource for tests. Tests must not depend on Oracle being available.
+- **Always include a null/edge case test** when the Pro*C source uses indicator variables (e.g., `balance_ind == -1` → test that null balance is handled).
+
 ## Architecture Layers
 
 Follow strict layered architecture. Each layer has specific responsibilities:
