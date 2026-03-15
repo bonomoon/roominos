@@ -60,19 +60,215 @@ config = Config()
 # ---------------------------------------------------------------------------
 
 _request_counter = 0
+_session_start: datetime | None = None
+
+
+def _generate_diagnosis(success: bool, was_repaired: bool, finish_reason: str | None, error: str | None, approx_input_tokens: int) -> str:
+    """Auto-generate a diagnosis line based on response characteristics."""
+    if error == "empty response" or not success:
+        return "⚠ Model returned empty response. Likely cause: context too large or model capacity exceeded."
+    if was_repaired:
+        return "🔧 JSON was repaired. Original response had malformed tool call arguments."
+    if finish_reason == "length":
+        return "⚠ Response truncated due to max_tokens. Consider increasing max_tokens."
+    return "✅ Normal response."
+
+
+def _build_markdown_report(
+    seq: int,
+    timestamp: datetime,
+    model: str,
+    messages: list,
+    tools_sent: int,
+    tool_names_sent: list[str],
+    approx_input_tokens: int,
+    resp_detail: dict,
+    usage: dict,
+    finish_reason: str | None,
+    was_repaired: bool,
+    attempt: int,
+    max_retries: int,
+    success: bool,
+    error: str | None,
+) -> str:
+    """Build a human-readable markdown report for a request/response pair."""
+    ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+    model_short = model.split("/")[-1] if "/" in model else model
+
+    # Context budget line
+    max_context = 32000
+    budget_pct = approx_input_tokens / max_context * 100
+    budget_status = "✅ OK" if budget_pct < 80 else "⚠ HIGH"
+    budget_line = f"{approx_input_tokens:,} / {max_context:,} ({budget_pct:.1f}%) {budget_status}"
+
+    # Tool names list
+    tools_label = f"{tools_sent} ({', '.join(tool_names_sent)})" if tool_names_sent else str(tools_sent)
+
+    # Last user message
+    last_user = next(
+        (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"),
+        "",
+    )
+    if isinstance(last_user, list):
+        # Content may be a list of content blocks
+        last_user = " ".join(
+            block.get("text", "") for block in last_user if isinstance(block, dict)
+        )
+    last_user_preview = str(last_user)[:500]
+
+    # System message preview
+    system_preview = ""
+    for m in messages:
+        if m.get("role") == "system":
+            content = m.get("content", "")
+            if isinstance(content, str) and content:
+                system_preview = content[:500]
+                break
+
+    # Response status
+    status_icon = "✅ Success" if success else "❌ Failed"
+
+    # Tool calls section
+    tool_calls_section = ""
+    if resp_detail.get("tool_calls"):
+        tool_calls_json = json.dumps(
+            [{"name": tc["name"], "arguments": tc["arguments"]} for tc in resp_detail["tool_calls"]],
+            ensure_ascii=False,
+            indent=2,
+        )
+        tool_calls_section = f"\n### Tool Calls\n```json\n{tool_calls_json}\n```\n"
+
+    # Content section
+    content_section = ""
+    if resp_detail.get("content_preview"):
+        content_section = f"\n### Content (if text response)\n```\n{resp_detail['content_preview']}\n```\n"
+
+    # Token usage
+    prompt_tokens = usage.get("prompt_tokens", "—")
+    completion_tokens = usage.get("completion_tokens", "—")
+    total_tokens = usage.get("total_tokens", "—")
+
+    # Diagnosis
+    diagnosis = _generate_diagnosis(success, was_repaired, finish_reason, error, approx_input_tokens)
+
+    repaired_str = "Yes" if was_repaired else "No"
+    finish_str = finish_reason or "—"
+
+    lines = [
+        f"# Forge Log #{seq} — [{ts_str}]",
+        "",
+        "## Request",
+        f"- **Model**: {model}",
+        f"- **Message count**: {len(messages)}",
+        f"- **Tools sent**: {tools_label}",
+        f"- **Approx input tokens**: {approx_input_tokens:,}",
+        f"- **Context budget**: {budget_line}",
+        "",
+        "### Last User Message",
+        "```",
+        last_user_preview,
+        "```",
+        "",
+    ]
+
+    if system_preview:
+        lines += [
+            "### System Messages (compressed)",
+            system_preview,
+            "",
+        ]
+
+    lines += [
+        "## Response",
+        f"- **Status**: {status_icon}",
+        f"- **Finish reason**: {finish_str}",
+        f"- **Was repaired**: {repaired_str}",
+        f"- **Attempt**: {attempt + 1}/{max_retries + 1}",
+        tool_calls_section.rstrip(),
+        content_section.rstrip(),
+        "",
+        "### Token Usage",
+        f"- Prompt: {prompt_tokens}",
+        f"- Completion: {completion_tokens}",
+        f"- Total: {total_tokens}",
+        "",
+        "## Diagnosis",
+        diagnosis,
+    ]
+
+    return "\n".join(line for line in lines if line is not None)
+
+
+def _append_session_summary(
+    log_dir: str,
+    seq: int,
+    timestamp: datetime,
+    model: str,
+    total_tokens: int | str,
+    tool_calls: list | None,
+    content_preview: str | None,
+    success: bool,
+    was_repaired: bool,
+    error: str | None,
+) -> None:
+    """Append one row to the session summary markdown table."""
+    global _session_start
+
+    summary_path = os.path.join(log_dir, "SESSION_SUMMARY.md")
+    time_str = timestamp.strftime("%H:%M:%S")
+    model_short = model.split("/")[-1] if "/" in model else model
+
+    # Determine what the response was
+    if tool_calls:
+        response_type = tool_calls[0]["name"] if tool_calls else "(tool)"
+    elif content_preview:
+        response_type = "(content)"
+    else:
+        response_type = "(empty)"
+
+    tokens_str = f"{total_tokens:,}" if isinstance(total_tokens, int) else str(total_tokens)
+    status_str = "✅" if success else "❌"
+    repaired_str = "Yes" if was_repaired else "No"
+
+    note = ""
+    if error == "empty response":
+        note = "Context over budget"
+    elif was_repaired:
+        note = "JSON repaired"
+
+    row = f"| {seq} | {time_str} | {model_short} | {tokens_str} | {response_type} | {status_str} | {repaired_str} | {note} |"
+
+    # Create file with header if it doesn't exist
+    if not os.path.exists(summary_path):
+        start_str = _session_start.strftime("%Y-%m-%d %H:%M:%S") if _session_start else time_str
+        header = (
+            f"# Forge Session Summary\n\n"
+            f"Started: {start_str}\n\n"
+            "| # | Time | Model | Tokens | Tool/Content | Status | Repaired | Note |\n"
+            "|---|------|-------|--------|-------------|--------|----------|------|\n"
+        )
+        with open(summary_path, "w") as f:
+            f.write(header)
+
+    with open(summary_path, "a") as f:
+        f.write(row + "\n")
 
 
 def log_to_file(req_body: dict, resp_body: dict, attempt: int, was_repaired: bool, error: str | None = None) -> str | None:
-    """Save request + response pair to a JSON file for analysis."""
+    """Save request + response pair to a JSON file and a markdown report for analysis."""
     if not config.log_dir:
         return None
 
-    global _request_counter
+    global _request_counter, _session_start
     _request_counter += 1
+    if _session_start is None:
+        _session_start = datetime.now()
 
     os.makedirs(config.log_dir, exist_ok=True)
-    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_request_counter:04d}.json"
-    filepath = os.path.join(config.log_dir, filename)
+    now = datetime.now()
+    stem = f"{now.strftime('%Y%m%d_%H%M%S')}_{_request_counter:04d}"
+    json_path = os.path.join(config.log_dir, f"{stem}.json")
+    md_path = os.path.join(config.log_dir, f"{stem}.md")
 
     # Extract key info for analysis
     messages = req_body.get("messages", [])
@@ -84,7 +280,7 @@ def log_to_file(req_body: dict, resp_body: dict, attempt: int, was_repaired: boo
     approx_input_tokens = len(req_text) // 4
 
     # Extract response info
-    resp_detail = {}
+    resp_detail: dict = {}
     for choice in resp_body.get("choices", []):
         msg = choice.get("message", {})
         tc = msg.get("tool_calls", [])
@@ -95,12 +291,16 @@ def log_to_file(req_body: dict, resp_body: dict, attempt: int, was_repaired: boo
             ]
         if msg.get("content"):
             resp_detail["content_length"] = len(msg["content"])
-            resp_detail["content_preview"] = msg["content"][:200]
+            resp_detail["content_preview"] = msg["content"][:500]
 
     usage = resp_body.get("usage", {})
+    finish_reason = resp_body.get("choices", [{}])[0].get("finish_reason")
+    success = bool(resp_detail.get("tool_calls") or resp_detail.get("content_length"))
+    max_retries = 2
 
+    # --- JSON log (existing behaviour, unchanged) ---
     log_entry = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": now.isoformat(),
         "sequence": _request_counter,
         "model": req_body.get("model", ""),
         "attempt": attempt,
@@ -116,16 +316,51 @@ def log_to_file(req_body: dict, resp_body: dict, attempt: int, was_repaired: boo
         "response": {
             **resp_detail,
             "usage": usage,
-            "finish_reason": resp_body.get("choices", [{}])[0].get("finish_reason"),
+            "finish_reason": finish_reason,
         },
-        "success": bool(resp_detail.get("tool_calls") or resp_detail.get("content_length")),
+        "success": success,
     }
 
-    with open(filepath, "w") as f:
+    with open(json_path, "w") as f:
         json.dump(log_entry, f, indent=2, ensure_ascii=False)
 
-    logger.info(f"[{_ts()}] 📝 logged → {filename}")
-    return filepath
+    # --- Markdown report (new) ---
+    md_content = _build_markdown_report(
+        seq=_request_counter,
+        timestamp=now,
+        model=req_body.get("model", ""),
+        messages=messages,
+        tools_sent=tools_sent,
+        tool_names_sent=tool_names_sent,
+        approx_input_tokens=approx_input_tokens,
+        resp_detail=resp_detail,
+        usage=usage,
+        finish_reason=finish_reason,
+        was_repaired=was_repaired,
+        attempt=attempt,
+        max_retries=max_retries,
+        success=success,
+        error=error,
+    )
+    with open(md_path, "w") as f:
+        f.write(md_content)
+
+    # --- Session summary (new) ---
+    _append_session_summary(
+        log_dir=config.log_dir,
+        seq=_request_counter,
+        timestamp=now,
+        model=req_body.get("model", ""),
+        total_tokens=usage.get("total_tokens", "—"),
+        tool_calls=resp_detail.get("tool_calls"),
+        content_preview=resp_detail.get("content_preview"),
+        success=success,
+        was_repaired=was_repaired,
+        error=error,
+    )
+
+    logger.info(f"[{_ts()}] 📝 logged → {stem}.json + .md")
+    return json_path
 
 # ---------------------------------------------------------------------------
 # JSON repair utilities
