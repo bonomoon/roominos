@@ -598,11 +598,12 @@ def compress_system_messages(messages: list[dict]) -> list[dict]:
 # Response repair
 # ---------------------------------------------------------------------------
 
-def sanitize_tool_name(name: str) -> tuple[str, bool]:
+def sanitize_tool_name(name: str, valid_tools: set[str] | None = None) -> tuple[str, bool]:
     """
     Clean corrupted tool names from weak models.
     E.g. "update_todo_list<|channel|>commentary" → "update_todo_list"
          "functions.read_file" → "read_file"
+         "write_file" → "write_to_file" (alias)
     Returns (cleaned_name, was_fixed).
     """
     if not name:
@@ -624,7 +625,52 @@ def sanitize_tool_name(name: str) -> tuple[str, bool]:
     # Keep only valid tool name chars (alphanumeric + underscore)
     name = re.sub(r"[^a-zA-Z0-9_]", "", name)
 
+    # Apply aliases using candidates list (pick first match in valid_tools)
+    if name in _TOOL_NAME_ALIAS_CANDIDATES:
+        candidates = _TOOL_NAME_ALIAS_CANDIDATES[name]
+        if valid_tools:
+            for candidate in candidates:
+                if candidate in valid_tools:
+                    name = candidate
+                    break
+        else:
+            name = candidates[0]
+
+    # If name is still not in valid tools, search all candidates
+    if valid_tools and name not in valid_tools:
+        for alias, candidates in _TOOL_NAME_ALIAS_CANDIDATES.items():
+            if alias in name:
+                for candidate in candidates:
+                    if candidate in valid_tools:
+                        name = candidate
+                        break
+                if name in valid_tools:
+                    break
+
     return name, name != original
+
+
+# Tool name aliases: model outputs wrong name → map to correct one
+# Aliases are resolved dynamically: target must exist in the request's tool list.
+# Multiple candidates are listed — the first match in valid_tools wins.
+_TOOL_NAME_ALIAS_CANDIDATES: dict[str, list[str]] = {
+    "write_file": ["write_to_file", "apply_diff"],       # 3.4.x has write_to_file, 3.51.x has apply_diff
+    "create_file": ["write_to_file", "apply_diff"],
+    "edit_file": ["apply_diff", "replace_in_file", "search_and_replace"],
+    "run_command": ["execute_command"],
+    "run": ["execute_command"],
+    "search": ["search_files"],
+    "find_files": ["search_files"],
+    "list": ["list_files"],
+    "complete": ["attempt_completion"],
+    "ask": ["ask_followup_question"],
+    "update_todo_list": ["attempt_completion"],
+}
+
+# Flat lookup built from candidates (first candidate is default)
+_TOOL_NAME_ALIASES: dict[str, str] = {
+    k: v[0] for k, v in _TOOL_NAME_ALIAS_CANDIDATES.items()
+}
 
 
 # Default values for required parameters when model omits them
@@ -678,6 +724,9 @@ def repair_response(body: dict, req_tools: list[dict] | None = None) -> tuple[di
     if req_tools is None:
         req_tools = []
 
+    # Build valid tool name set for alias resolution
+    valid_tool_names = {t.get("function", {}).get("name", "") for t in req_tools if t.get("type") == "function"}
+
     choices = body.get("choices", [])
     for choice in choices:
         msg = choice.get("message", {})
@@ -690,7 +739,7 @@ def repair_response(body: dict, req_tools: list[dict] | None = None) -> tuple[di
 
             # 1. Sanitize tool name
             raw_name = fn.get("name", "")
-            clean_name, name_fixed = sanitize_tool_name(raw_name)
+            clean_name, name_fixed = sanitize_tool_name(raw_name, valid_tools=valid_tool_names)
             if name_fixed:
                 logger.info(f"[{_ts()}] 🔧 sanitized tool name: {raw_name!r} → {clean_name!r}")
                 fn["name"] = clean_name
@@ -711,7 +760,20 @@ def repair_response(body: dict, req_tools: list[dict] | None = None) -> tuple[di
             elif isinstance(args_str, dict):
                 parsed_args = args_str
 
-            # 3. Inject missing required parameters
+            # 3. Transform arguments when tool was aliased (e.g. write_file → apply_diff)
+            if name_fixed and clean_name == "apply_diff" and isinstance(parsed_args, dict):
+                # Model sent write_file(path, content) → convert to apply_diff(path, diff)
+                if "content" in parsed_args and "path" in parsed_args:
+                    content = parsed_args["content"]
+                    path = parsed_args["path"]
+                    # Create a diff that adds the entire file content
+                    diff_content = f"--- /dev/null\n+++ {path}\n@@ -0,0 +1 @@\n+{content}"
+                    parsed_args = {"path": path, "diff": diff_content}
+                    fn["arguments"] = json.dumps(parsed_args)
+                    repaired = True
+                    logger.info(f"[{_ts()}] 🔧 transformed write_file args → apply_diff format")
+
+            # 4. Inject missing required parameters
             if clean_name and isinstance(parsed_args, dict):
                 patched_args, params_fixed = inject_missing_required_params(clean_name, parsed_args, req_tools)
                 if params_fixed:
@@ -726,6 +788,111 @@ def repair_response(body: dict, req_tools: list[dict] | None = None) -> tuple[di
             msg["tool_calls"] = fixed_calls
             choice["message"] = msg
     return body, repaired
+
+
+def extract_tool_calls_from_text(body: dict, req_tools: list[dict] | None = None) -> tuple[dict, bool]:
+    """
+    NonNativeToolCallingMixin pattern: when a weak model outputs tool calls
+    as plain text instead of structured tool_calls, extract and convert them.
+
+    Detects patterns like:
+    - to=functions.read_file ... {"path": "..."}
+    - {"name": "write_to_file", "arguments": {"path": "...", "content": "..."}}
+    - <|channel|> corrupted tool call attempts
+    """
+    if req_tools is None:
+        req_tools = []
+
+    # Build set of valid tool names from request
+    valid_tools = set()
+    for t in req_tools:
+        fn = t.get("function", {})
+        name = fn.get("name", "")
+        if name:
+            valid_tools.add(name)
+
+    converted = False
+    for choice in body.get("choices", []):
+        msg = choice.get("message", {})
+
+        # Only process if there's content but NO tool_calls
+        if msg.get("tool_calls"):
+            continue
+        content = msg.get("content", "")
+        if not content or not isinstance(content, str):
+            continue
+
+        # Strategy 1: Find "to=functions.<tool_name>" pattern
+        match = re.search(r'to=functions\.(\w+).*?(\{.*)', content, re.DOTALL)
+        if match:
+            tool_name = match.group(1)
+            json_part = match.group(2)
+            # Clean the tool name
+            tool_name, _ = sanitize_tool_name(tool_name)
+            if tool_name in valid_tools:
+                parsed, _ = repair_json(json_part)
+                if parsed is not None:
+                    msg["tool_calls"] = [{
+                        "id": f"forge_extracted_{id(msg)}",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(parsed)
+                        }
+                    }]
+                    msg["content"] = None
+                    converted = True
+                    logger.info(f"[{_ts()}] 🔄 extracted tool call from text: {tool_name}")
+                    continue
+
+        # Strategy 2: Find {"name": "<tool>", "arguments": {...}} in content
+        match = re.search(r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}', content, re.DOTALL)
+        if match:
+            tool_name = match.group(1)
+            args_str = match.group(2)
+            tool_name, _ = sanitize_tool_name(tool_name)
+            if tool_name in valid_tools:
+                parsed, _ = repair_json(args_str)
+                if parsed is not None:
+                    msg["tool_calls"] = [{
+                        "id": f"forge_extracted_{id(msg)}",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(parsed)
+                        }
+                    }]
+                    msg["content"] = None
+                    converted = True
+                    logger.info(f"[{_ts()}] 🔄 extracted tool call from JSON in text: {tool_name}")
+                    continue
+
+        # Strategy 3: Find bare tool name followed by JSON (e.g. "read_file\n{...}")
+        for tool_name in valid_tools:
+            pattern = re.escape(tool_name) + r'\s*[\n:]*\s*(\{.*?\})'
+            match = re.search(pattern, content, re.DOTALL)
+            if match:
+                args_str = match.group(1)
+                parsed, _ = repair_json(args_str)
+                if parsed is not None:
+                    msg["tool_calls"] = [{
+                        "id": f"forge_extracted_{id(msg)}",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(parsed)
+                        }
+                    }]
+                    msg["content"] = None
+                    converted = True
+                    logger.info(f"[{_ts()}] 🔄 extracted tool call from bare name: {tool_name}")
+                    break
+
+        # If we found tool calls, update finish_reason
+        if converted:
+            choice["finish_reason"] = "tool_calls"
+
+    return body, converted
 
 
 def normalize_reasoning_response(body: dict) -> dict:
@@ -861,12 +1028,33 @@ async def proxy_chat_completions(request: Request) -> Response:
     budget_warning = check_context_budget(req_body)
     if budget_warning:
         logger.warning(f"[{_ts()}] ⚠ {budget_warning['warning']}")
+        # Inject warning into system message so the model knows to wrap up
+        if budget_warning["usage_percent"] > 70:
+            req_body.setdefault("messages", []).insert(0, {
+                "role": "system",
+                "content": (
+                    f"[FORGE WARNING] Context at {budget_warning['usage_percent']:.0f}% "
+                    f"({budget_warning['approx_tokens']:,} tokens). "
+                    "Finish current file and use attempt_completion. "
+                    "User should start a New Task for remaining work."
+                )
+            })
 
     log_request(request.method, "/v1/chat/completions", len(req_body.get("tools", [])))
 
     headers = build_upstream_headers(request)
 
-    # Streaming: passthrough directly (no JSON repair possible on SSE)
+    # When tools are present and streaming is requested:
+    # Fetch as non-streaming from upstream, repair, then re-emit as streaming to client
+    original_stream = req_body.get("stream", False)
+    if original_stream and req_body.get("tools"):
+        req_body["stream"] = False
+        logger.info(f"[{_ts()}] 🔧 fetching non-streaming for repair, will re-emit as SSE")
+
+        # Run the full non-streaming repair pipeline below, then wrap result as SSE
+        # (fall through to the non-streaming code path, but wrap response at the end)
+
+    # Streaming: passthrough for non-tool requests only
     if req_body.get("stream"):
         from starlette.responses import StreamingResponse
 
@@ -977,6 +1165,11 @@ async def proxy_chat_completions(request: Request) -> Response:
         # Repair tool_calls JSON
         resp_body, was_repaired = repair_response(resp_body, req_tools=req_body.get("tools", []))
 
+        # Extract tool calls from text content (NonNativeToolCallingMixin pattern)
+        resp_body, was_extracted = extract_tool_calls_from_text(resp_body, req_tools=req_body.get("tools", []))
+        if was_extracted:
+            was_repaired = True
+
         # Retry if empty response
         if not response_has_content(resp_body):
             if attempt < max_retries:
@@ -994,6 +1187,24 @@ async def proxy_chat_completions(request: Request) -> Response:
             detail += " [repaired]"
         log_response(200, detail)
         log_to_file(req_body, resp_body, attempt=attempt, was_repaired=was_repaired)
+
+        # If client requested streaming, convert response to proper SSE chunk format
+        if original_stream:
+            from starlette.responses import StreamingResponse
+
+            # Convert chat.completion to chat.completion.chunk format
+            chunk_body = dict(resp_body)
+            chunk_body["object"] = "chat.completion.chunk"
+            for choice in chunk_body.get("choices", []):
+                msg = choice.pop("message", {})
+                choice["delta"] = msg
+
+            async def sse_chunks():
+                yield f"data: {json.dumps(chunk_body)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+
+            return StreamingResponse(sse_chunks(), media_type="text/event-stream")
+
         return JSONResponse(resp_body)
 
     # Should not reach here

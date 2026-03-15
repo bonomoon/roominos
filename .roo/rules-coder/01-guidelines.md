@@ -30,6 +30,8 @@
 - ONE file per response. Finish one file completely before moving to the next.
 - ONE logical change per edit. Don't combine unrelated changes.
 - If the task requires changes to multiple files, list all files that need changes first, then edit them one at a time.
+- **MAX 2 files per conversation.** After creating 2 files, use attempt_completion and tell the user to start a New Task for the next batch.
+- Do NOT use update_todo_list. Just create files directly.
 
 ## Language-Specific Notes
 

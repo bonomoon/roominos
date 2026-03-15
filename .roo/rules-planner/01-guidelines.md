@@ -55,8 +55,29 @@ Branch: [branch-name]
 ### Process
 1. Read research.md (this is your only context about the codebase)
 2. Break work into batches ordered by dependency
-3. Each batch contains 1-3 tasks that can run in parallel
+3. **Each batch contains MAX 1-2 files to create/modify** (weak models fail on 3+ files per batch)
 4. Produce `plan.md` with all tasks
+
+### CRITICAL: Batch Size Rules for Weak Models
+- **1 file per task** is ideal. Never more than 2 files per task.
+- Each batch = 1 conversation turn in Coder mode
+- After each batch: user must start **New Task (+)** to reset context
+- If a file is large (>200 lines), it gets its own dedicated batch
+- Always put test files in a SEPARATE batch from implementation files
+
+### Batch Ordering
+```
+Batch 1: pom.xml (or build config)
+Batch 2: Entity classes (1-2 max)
+Batch 3: Repository interfaces
+Batch 4: Service interface + impl
+Batch 5: Controller
+Batch 6: DTO classes
+Batch 7: application.yml + application-test.yml
+Batch 8: Test classes (1 per batch)
+Batch 9: Build verification (mvn clean test)
+```
+Between EVERY batch: **New Task (+)** to reset context.
 
 ### plan.md Template
 
