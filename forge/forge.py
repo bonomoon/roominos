@@ -598,12 +598,86 @@ def compress_system_messages(messages: list[dict]) -> list[dict]:
 # Response repair
 # ---------------------------------------------------------------------------
 
-def repair_response(body: dict) -> tuple[dict, bool]:
+def sanitize_tool_name(name: str) -> tuple[str, bool]:
+    """
+    Clean corrupted tool names from weak models.
+    E.g. "update_todo_list<|channel|>commentary" → "update_todo_list"
+         "functions.read_file" → "read_file"
+    Returns (cleaned_name, was_fixed).
+    """
+    if not name:
+        return name, False
+
+    original = name
+
+    # Remove <|...|> tokens (common in weak model outputs)
+    name = re.sub(r"<\|[^|]*\|>.*", "", name)
+
+    # Remove "functions." prefix
+    if name.startswith("functions."):
+        name = name[len("functions."):]
+
+    # Remove "to=" prefix
+    if name.startswith("to="):
+        name = name[len("to="):]
+
+    # Keep only valid tool name chars (alphanumeric + underscore)
+    name = re.sub(r"[^a-zA-Z0-9_]", "", name)
+
+    return name, name != original
+
+
+# Default values for required parameters when model omits them
+_TOOL_PARAM_DEFAULTS: dict[str, dict[str, str]] = {
+    "search_files": {"path": "."},
+    "list_files": {"path": "."},
+    "list_code_definition_names": {"path": "."},
+    "read_file": {"path": ""},
+    "execute_command": {"command": "echo 'no command specified'"},
+}
+
+
+def inject_missing_required_params(tool_name: str, args: dict, req_tools: list[dict]) -> tuple[dict, bool]:
+    """
+    If a required parameter is missing from tool call args, inject a default.
+    Uses the tool schema from the request to determine required params.
+    Falls back to _TOOL_PARAM_DEFAULTS for common tools.
+    """
+    fixed = False
+
+    # Find the tool schema in the request
+    schema_required: list[str] = []
+    for tool in req_tools:
+        fn = tool.get("function", {})
+        if fn.get("name") == tool_name:
+            schema_required = fn.get("parameters", {}).get("required", [])
+            break
+
+    # Check each required param
+    defaults = _TOOL_PARAM_DEFAULTS.get(tool_name, {})
+    for param in schema_required:
+        if param not in args:
+            default_val = defaults.get(param, "")
+            if default_val:
+                args[param] = default_val
+                fixed = True
+                logger.info(f"[{_ts()}] 🔧 injected missing param: {tool_name}.{param}={default_val!r}")
+
+    return args, fixed
+
+
+def repair_response(body: dict, req_tools: list[dict] | None = None) -> tuple[dict, bool]:
     """
     Inspect and repair tool_calls JSON inside a chat completion response.
+    - Repairs malformed JSON in arguments
+    - Sanitizes corrupted tool names
+    - Injects missing required parameters
     Returns (repaired_body, was_repaired).
     """
     repaired = False
+    if req_tools is None:
+        req_tools = []
+
     choices = body.get("choices", [])
     for choice in choices:
         msg = choice.get("message", {})
@@ -611,16 +685,42 @@ def repair_response(body: dict) -> tuple[dict, bool]:
         fixed_calls = []
         for tc in tool_calls:
             fn = tc.get("function", {})
+            tc = dict(tc)
+            fn = dict(fn)
+
+            # 1. Sanitize tool name
+            raw_name = fn.get("name", "")
+            clean_name, name_fixed = sanitize_tool_name(raw_name)
+            if name_fixed:
+                logger.info(f"[{_ts()}] 🔧 sanitized tool name: {raw_name!r} → {clean_name!r}")
+                fn["name"] = clean_name
+                repaired = True
+
+            # 2. Repair JSON arguments
             args_str = fn.get("arguments", "")
+            parsed_args = {}
             if isinstance(args_str, str) and args_str:
                 parsed, was_fixed = repair_json(args_str)
-                if was_fixed and parsed is not None:
-                    fn = dict(fn)
-                    fn["arguments"] = json.dumps(parsed)
-                    tc = dict(tc)
-                    tc["function"] = fn
+                if parsed is not None:
+                    parsed_args = parsed
+                    if was_fixed:
+                        fn["arguments"] = json.dumps(parsed)
+                        repaired = True
+                else:
+                    parsed_args = {}
+            elif isinstance(args_str, dict):
+                parsed_args = args_str
+
+            # 3. Inject missing required parameters
+            if clean_name and isinstance(parsed_args, dict):
+                patched_args, params_fixed = inject_missing_required_params(clean_name, parsed_args, req_tools)
+                if params_fixed:
+                    fn["arguments"] = json.dumps(patched_args)
                     repaired = True
+
+            tc["function"] = fn
             fixed_calls.append(tc)
+
         if repaired:
             msg = dict(msg)
             msg["tool_calls"] = fixed_calls
@@ -875,7 +975,7 @@ async def proxy_chat_completions(request: Request) -> Response:
         resp_body = normalize_reasoning_response(resp_body)
 
         # Repair tool_calls JSON
-        resp_body, was_repaired = repair_response(resp_body)
+        resp_body, was_repaired = repair_response(resp_body, req_tools=req_body.get("tools", []))
 
         # Retry if empty response
         if not response_has_content(resp_body):
