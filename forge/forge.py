@@ -771,12 +771,16 @@ def filter_tools_by_mode(tools: list[dict], system_content: str) -> list[dict]:
 # System prompt compression
 # ---------------------------------------------------------------------------
 
+_diff_fail_count = 0
+
+
 def inject_diff_failure_guidance(messages: list[dict]) -> list[dict]:
     """
     Detect apply_diff failures in tool_results and inject guidance.
-    When Roo Code returns 'No sufficiently similar match' or 'needs 100%',
-    tell the model to read_file first before retrying.
+    First failure: tell model to read_file first.
+    3+ failures: tell model to SKIP this file and move on.
     """
+    global _diff_fail_count
     diff_error_patterns = [
         "sufficiently similar match",
         "needs 100%",
@@ -812,16 +816,25 @@ def inject_diff_failure_guidance(messages: list[dict]) -> list[dict]:
             break
 
     if found_diff_error:
-        guidance = (
-            "[FORGE] Previous apply_diff FAILED. To fix:\n"
-            "1. Call read_file to get the EXACT current content of the file.\n"
-            "2. Use the EXACT text from read_file in your diff.\n"
-            "3. Diff format MUST be:\n"
-            "<<<<<<< SEARCH\n:start_line: N\n-------\n[exact old text]\n=======\n[new text]\n>>>>>>> REPLACE\n"
-            "Do NOT guess content. Do NOT use --- +++ @@ format."
-        )
+        _diff_fail_count += 1
+
+        if _diff_fail_count >= 3:
+            # Too many failures — tell model to skip and use write_to_file instead
+            guidance = (
+                "[FORGE] apply_diff has FAILED 3+ times. STOP trying apply_diff.\n"
+                "Use write_to_file instead to create the file with full content.\n"
+                "If the file already exists, use write_to_file to overwrite it.\n"
+                "Move on to the next task."
+            )
+            _diff_fail_count = 0  # reset for next file
+            logger.info(f"[{_ts()}] 🔧 diff failed 3+ times → switching to write_to_file")
+        else:
+            guidance = (
+                "[FORGE] apply_diff FAILED. Use write_to_file instead of apply_diff.\n"
+                "write_to_file(path='file.java', content='full file content here')"
+            )
         if target_file:
-            guidance += f" Target file: {target_file}"
+            guidance += f"\nTarget file: {target_file}"
 
         logger.info(f"[{_ts()}] 🔧 diff failure detected, injecting read_file guidance")
 
@@ -1616,6 +1629,10 @@ async def proxy_chat_completions(request: Request) -> Response:
             detail += " [repaired]"
         log_response(200, detail)
         record_used_tools(resp_body)  # Track for deferred schema loading
+        # Reset diff fail counter on successful response
+        global _diff_fail_count
+        if response_has_content(resp_body):
+            _diff_fail_count = 0
         log_to_file(req_body, resp_body, attempt=attempt, was_repaired=was_repaired)
 
         # If client requested streaming, convert response to proper SSE chunk format
