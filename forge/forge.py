@@ -534,6 +534,167 @@ def check_context_budget(req_body: dict, warn_threshold: float = 0.4, max_contex
 
 
 # ---------------------------------------------------------------------------
+# Tool result size limiter
+# ---------------------------------------------------------------------------
+
+def limit_tool_results(messages: list[dict], max_lines: int = 200) -> list[dict]:
+    """
+    Truncate large tool results (e.g. read_file returning 1000+ lines).
+    Keeps first 50 and last 50 lines, drops middle.
+    """
+    result = []
+    for msg in messages:
+        if msg.get("role") != "tool" and msg.get("role") != "user":
+            result.append(msg)
+            continue
+
+        content = msg.get("content", "")
+        # Handle list-type content (Roo Code sends [{type: "tool_result", content: "..."}])
+        if isinstance(content, list):
+            new_blocks = []
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("content"), str):
+                    block_content = block["content"]
+                    lines = block_content.split("\n")
+                    if len(lines) > max_lines:
+                        keep_head = 50
+                        keep_tail = 50
+                        truncated = (
+                            "\n".join(lines[:keep_head])
+                            + f"\n\n... [FORGE: truncated {len(lines) - keep_head - keep_tail} lines] ...\n\n"
+                            + "\n".join(lines[-keep_tail:])
+                        )
+                        block = dict(block)
+                        block["content"] = truncated
+                        logger.info(f"[{_ts()}] ✂ tool result truncated: {len(lines)}→{keep_head + keep_tail} lines")
+                new_blocks.append(block)
+            msg = dict(msg)
+            msg["content"] = new_blocks
+        elif isinstance(content, str):
+            lines = content.split("\n")
+            if len(lines) > max_lines:
+                keep_head = 50
+                keep_tail = 50
+                msg = dict(msg)
+                msg["content"] = (
+                    "\n".join(lines[:keep_head])
+                    + f"\n\n... [FORGE: truncated {len(lines) - keep_head - keep_tail} lines] ...\n\n"
+                    + "\n".join(lines[-keep_tail:])
+                )
+                logger.info(f"[{_ts()}] ✂ tool result truncated: {len(lines)}→{keep_head + keep_tail} lines")
+
+        result.append(msg)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Conversation history summarization
+# ---------------------------------------------------------------------------
+
+def summarize_old_turns(messages: list[dict], keep_recent: int = 6, max_turns: int = 10) -> list[dict]:
+    """
+    When conversation exceeds max_turns, compress old turns to 1-line summaries.
+    Keeps system messages and last keep_recent messages intact.
+    """
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    conv_msgs = [m for m in messages if m.get("role") != "system"]
+
+    if len(conv_msgs) <= max_turns:
+        return messages
+
+    # Split: old turns to summarize, recent turns to keep
+    old = conv_msgs[:-keep_recent]
+    recent = conv_msgs[-keep_recent:]
+
+    # Summarize old turns
+    summaries = []
+    for i, msg in enumerate(old):
+        role = msg.get("role", "?")
+        content = msg.get("content", "")
+
+        if isinstance(content, list):
+            # Extract text from content blocks
+            texts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "tool_result":
+                        texts.append(f"tool_result({block.get('content', '')[:50]})")
+                    elif block.get("type") == "text":
+                        texts.append(block.get("text", "")[:50])
+            summary_text = "; ".join(texts)[:100]
+        elif isinstance(content, str):
+            summary_text = content[:100]
+        else:
+            summary_text = str(content)[:100]
+
+        # Check for tool_calls
+        tool_calls = msg.get("tool_calls", [])
+        if tool_calls:
+            tool_names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
+            summary_text = f"called: {', '.join(tool_names)}"
+
+        summaries.append(f"[Turn {i+1}] {role}: {summary_text}")
+
+    summary_msg = {
+        "role": "system",
+        "content": "[FORGE: conversation history compressed]\n" + "\n".join(summaries)
+    }
+
+    logger.info(f"[{_ts()}] ✂ summarized {len(old)} old turns → 1 summary message")
+    return system_msgs + [summary_msg] + recent
+
+
+# ---------------------------------------------------------------------------
+# Deferred tool schema loading
+# ---------------------------------------------------------------------------
+
+# Track which tools the model has already used (per session)
+_used_tools: set[str] = set()
+
+
+def defer_tool_schemas(tools: list[dict]) -> list[dict]:
+    """
+    First request: send tool name + short description only (no parameters).
+    After model uses a tool: include full schema for that tool in subsequent requests.
+    Saves ~2-3k tokens on initial requests.
+    """
+    global _used_tools
+    deferred = []
+
+    for tool in tools:
+        fn = tool.get("function", {})
+        name = fn.get("name", "")
+
+        if name in _used_tools:
+            # Model already used this tool — send full schema
+            deferred.append(tool)
+        else:
+            # First time — send minimal schema (name + description only)
+            minimal = dict(tool)
+            minimal_fn = {
+                "name": name,
+                "description": fn.get("description", ""),
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }
+            minimal["function"] = minimal_fn
+            deferred.append(minimal)
+
+    return deferred
+
+
+def record_used_tools(resp_body: dict) -> None:
+    """Track which tools the model has called so we can provide full schemas next time."""
+    global _used_tools
+    for choice in resp_body.get("choices", []):
+        msg = choice.get("message", {})
+        for tc in msg.get("tool_calls", []):
+            name = tc.get("function", {}).get("name", "")
+            if name and name not in _used_tools:
+                _used_tools.add(name)
+                logger.info(f"[{_ts()}] 📋 tool schema unlocked: {name}")
+
+
+# ---------------------------------------------------------------------------
 # Context auto-truncation
 # ---------------------------------------------------------------------------
 
@@ -1179,9 +1340,21 @@ async def proxy_chat_completions(request: Request) -> Response:
     if tools and isinstance(system_content, str):
         tools = filter_tools_by_mode(tools, system_content)
 
+    # Deferred tool schema loading (minimal schema until tool is used)
+    if tools:
+        tools = defer_tool_schemas(tools)
+
     # Simplify remaining tools
     if tools:
         req_body["tools"] = simplify_tools(tools, config.max_tools)
+
+    # Limit large tool results (read_file > 200 lines → truncate)
+    if "messages" in req_body:
+        req_body["messages"] = limit_tool_results(req_body["messages"])
+
+    # Summarize old conversation turns (>10 turns → compress old ones)
+    if "messages" in req_body:
+        req_body["messages"] = summarize_old_turns(req_body["messages"])
 
     # Compress system messages to save context budget
     if "messages" in req_body:
@@ -1357,6 +1530,7 @@ async def proxy_chat_completions(request: Request) -> Response:
         if was_repaired:
             detail += " [repaired]"
         log_response(200, detail)
+        record_used_tools(resp_body)  # Track for deferred schema loading
         log_to_file(req_body, resp_body, attempt=attempt, was_repaired=was_repaired)
 
         # If client requested streaming, convert response to proper SSE chunk format
