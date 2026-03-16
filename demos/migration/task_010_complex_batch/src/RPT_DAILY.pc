@@ -1,0 +1,719 @@
+/* ============================================= */
+/* 프로그램명 : RPT_DAILY                         */
+/* 설    명 : 일일 정산 리포트 생성 프로그램        */
+/* 작 성 자 : 이과장                              */
+/* 작 성 일 : 2009.08.20                          */
+/* 수 정 이 력 :                                  */
+/*   2011.03.10 박사원 - 영업점 트리구조 추가     */
+/*   2013.07.22 김대리 - 수수료 항목 추가         */
+/*   2016.01.15 최주임 - 고객등급별 통계 추가     */
+/*   2019.04.30 정대리 - 한도초과 리포트 추가     */
+/*   2021.06.11 박과장 - CSV 추가하려다 말았음    */
+/* ============================================= */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "common_def.h"
+
+EXEC SQL INCLUDE sqlca;
+
+/* ============================================= */
+/* 호스트 변수 — RPT_DAILY 전용                    */
+/* SETTLE_BAT이랑 변수명이 겹치는게 있는데        */
+/* 별도 프로그램이라 상관없음 (링크 안함)          */
+/* ============================================= */
+EXEC SQL BEGIN DECLARE SECTION;
+    char    r_batch_dt[9];
+    char    r_br_cd[5];
+    char    r_br_nm[51];
+    int     r_total_cnt;
+    int     r_succ_cnt;
+    int     r_fail_cnt;
+    int     r_skip_cnt;
+    double  r_total_settle;
+    double  r_total_int;
+    double  r_total_fee;
+    double  r_total_tax;
+    double  r_avg_bal;
+    double  r_max_bal;
+    double  r_min_bal;
+    int     r_acct_type;
+    int     r_cust_grade;
+    int     r_grade_cnt;
+    double  r_grade_amt;
+    double  r_limit_over_amt;
+    int     r_limit_over_cnt;
+    char    r_parent_br[5];
+    int     r_br_level;
+    char    r_db_uid[31];
+    char    r_db_pwd[31];
+    char    r_db_sid[31];
+    short   r_settle_ind;
+    short   r_int_ind;
+    short   r_fee_ind;
+    short   r_tax_ind;
+    short   r_avg_ind;
+    short   r_max_ind;
+    short   r_min_ind;
+    short   r_over_amt_ind;
+    short   r_over_cnt_ind;
+    short   r_parent_ind;
+    /* 2016.01.15 최주임 추가 */
+    int     r_grade1_cnt;
+    int     r_grade2_cnt;
+    int     r_grade3_cnt;
+    int     r_grade4_cnt;
+    int     r_grade5_cnt;
+    double  r_grade1_amt;
+    double  r_grade2_amt;
+    double  r_grade3_amt;
+    double  r_grade4_amt;
+    double  r_grade5_amt;
+EXEC SQL END DECLARE SECTION;
+
+/* 전역변수 */
+FILE *rpt_fp = NULL;
+FILE *rpt_log_fp = NULL;
+char g_err_msg[MAX_ERR_MSG];   /* SETTLE_BAT이랑 같은 이름 — 별도 프로그램이라 OK */
+int  rpt_debug = 0;
+char rpt_path[MAX_PATH_LEN];
+char rpt_log_path[MAX_PATH_LEN];
+int  grand_total_cnt = 0;
+double grand_total_settle = 0.0;
+double grand_total_int = 0.0;
+double grand_total_fee = 0.0;
+double grand_total_tax = 0.0;
+int  br_count = 0;
+
+/* 리포트 라인 폭 — 고정폭 텍스트 파일 */
+#define RPT_WIDTH 132
+#define RPT_SEP "======================================================================================================================================"
+#define RPT_LINE "--------------------------------------------------------------------------------------------------------------------------------------"
+
+/* ============================================= */
+/* 함수 프로토타입                                */
+/* ============================================= */
+int  gen_branch_report(char *batch_dt);
+int  gen_grade_report(char *batch_dt);
+int  gen_type_report(char *batch_dt);
+int  gen_limit_report(char *batch_dt);
+void print_rpt_header(FILE *fp, char *batch_dt, char *title);
+void print_rpt_footer(FILE *fp);
+
+/* 2021.06.11 박과장 - CSV 추가하려다 말았음 */
+/* int gen_csv_report(char *batch_dt, char *out_path); */
+
+
+/* ============================================= */
+/* main                                          */
+/* RPT_DAILY 는 SETTLE_BAT 실행 후에 돌림         */
+/* 사용법: RPT_DAILY YYYYMMDD [DEBUG]             */
+/* ============================================= */
+int main(int argc, char *argv[])
+{
+    int rc;
+    time_t start_t, end_t;
+    char batch_dt[9];
+
+    start_t = time(NULL);
+
+    if(argc < 2) {
+        fprintf(stderr, "사용법: %s YYYYMMDD [DEBUG]\n", argv[0]);
+        return ERR_PARAM_MISSING;
+    }
+
+    memset(batch_dt, 0x00, sizeof(batch_dt));
+    strncpy(batch_dt, argv[1], 8);
+    batch_dt[8] = '\0';
+
+    if(!IS_VALID_DATE(batch_dt)) {
+        fprintf(stderr, "일자 오류: [%s]\n", batch_dt);
+        return ERR_PARAM_DATE;
+    }
+
+    if(argc >= 3) rpt_debug = atoi(argv[2]);
+
+    /* 리포트 파일 경로 */
+    sprintf(rpt_path, "/app/batch/report/RPT_DAILY_%s.txt", batch_dt);
+    sprintf(rpt_log_path, "/app/batch/log/RPT_DAILY_%s.log", batch_dt);
+
+    rpt_fp = fopen(rpt_path, "w");
+    if(rpt_fp == NULL) {
+        rpt_fp = stdout;
+        fprintf(stderr, "경고: 리포트 파일 오픈 실패 [%s]\n", rpt_path);
+    }
+
+    rpt_log_fp = fopen(rpt_log_path, "a");
+    if(rpt_log_fp == NULL) {
+        rpt_log_fp = stderr;
+    }
+
+    LOG_MSG(rpt_log_fp, "RPT_DAILY 시작 — 배치일자: %s", batch_dt);
+
+    /* DB 접속 — SETTLE_BAT이랑 같은 방식이지만 코드 복붙 */
+    memset(r_db_uid, 0x00, sizeof(r_db_uid));
+    memset(r_db_pwd, 0x00, sizeof(r_db_pwd));
+    memset(r_db_sid, 0x00, sizeof(r_db_sid));
+
+    if(getenv("ORACLE_UID") != NULL) {
+        strcpy(r_db_uid, getenv("ORACLE_UID"));
+    } else {
+        strcpy(r_db_uid, "BATCH_USER");
+    }
+    if(getenv("ORACLE_PWD") != NULL) {
+        strcpy(r_db_pwd, getenv("ORACLE_PWD"));
+    } else {
+        strcpy(r_db_pwd, "batch1234");
+    }
+    if(getenv("ORACLE_SID") != NULL) {
+        strcpy(r_db_sid, getenv("ORACLE_SID"));
+    } else {
+        strcpy(r_db_sid, "PRODDB");
+    }
+
+    EXEC SQL WHENEVER SQLERROR GOTO RPT_DB_ERR;
+    EXEC SQL CONNECT :r_db_uid IDENTIFIED BY :r_db_pwd USING :r_db_sid;
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+    LOG_MSG(rpt_log_fp, "DB 접속 성공");
+
+    strcpy(r_batch_dt, batch_dt);
+
+    /* 배치 처리 결과 확인 */
+    EXEC SQL SELECT NVL(TOTAL_CNT, 0), NVL(SUCC_CNT, 0), NVL(ERR_CNT, 0)
+        INTO :r_total_cnt, :r_succ_cnt, :r_fail_cnt
+        FROM TB_BATCH_CTL
+        WHERE BATCH_ID = 'SETTLE_BAT'
+        AND   BATCH_DT = :r_batch_dt;
+
+    if(sqlca.sqlcode == 1403) {
+        LOG_ERR(rpt_log_fp, "배치 실행 결과 없음: %s", batch_dt);
+        fprintf(rpt_fp, "*** 해당 일자 배치 실행 결과 없음 ***\n");
+        goto RPT_CLEANUP;
+    }
+    if(sqlca.sqlcode != 0) {
+        LOG_ERR(rpt_log_fp, "배치 결과 조회 오류: sqlcode=%d", sqlca.sqlcode);
+        goto RPT_CLEANUP;
+    }
+
+    LOG_MSG(rpt_log_fp, "배치결과: total=%d succ=%d fail=%d", r_total_cnt, r_succ_cnt, r_fail_cnt);
+
+    /* =========================================== */
+    /* 리포트 1: 영업점별 정산 현황                 */
+    /* =========================================== */
+    print_rpt_header(rpt_fp, batch_dt, "영업점별 정산 현황");
+
+    rc = gen_branch_report(batch_dt);
+    if(rc != 0) {
+        LOG_ERR(rpt_log_fp, "영업점별 리포트 생성 실패: rc=%d", rc);
+    }
+
+    /* =========================================== */
+    /* 리포트 2: 고객등급별 통계                    */
+    /* 2016.01.15 최주임 추가                       */
+    /* =========================================== */
+    print_rpt_header(rpt_fp, batch_dt, "고객등급별 정산 통계");
+
+    rc = gen_grade_report(batch_dt);
+    if(rc != 0) {
+        LOG_ERR(rpt_log_fp, "고객등급별 리포트 생성 실패: rc=%d", rc);
+    }
+
+    /* =========================================== */
+    /* 리포트 3: 계좌유형별 통계                    */
+    /* =========================================== */
+    print_rpt_header(rpt_fp, batch_dt, "계좌유형별 정산 통계");
+
+    rc = gen_type_report(batch_dt);
+    if(rc != 0) {
+        LOG_ERR(rpt_log_fp, "계좌유형별 리포트 생성 실패: rc=%d", rc);
+    }
+
+    /* =========================================== */
+    /* 리포트 4: 한도초과 현황                      */
+    /* 2019.04.30 정대리 추가                       */
+    /* =========================================== */
+    print_rpt_header(rpt_fp, batch_dt, "한도초과 현황");
+
+    rc = gen_limit_report(batch_dt);
+    if(rc != 0) {
+        LOG_ERR(rpt_log_fp, "한도초과 리포트 생성 실패: rc=%d", rc);
+    }
+
+    /* 2021.06.11 박과장 - CSV 리포트 추가하려고 했는데 */
+    /* 기획팀에서 "나중에 하자" 해서 보류 */
+    /*
+    {
+        char csv_path[MAX_PATH_LEN];
+        sprintf(csv_path, "/app/batch/report/RPT_DAILY_%s.csv", batch_dt);
+        rc = gen_csv_report(batch_dt, csv_path);
+        if(rc != 0) {
+            LOG_ERR(rpt_log_fp, "CSV 리포트 생성 실패: rc=%d", rc);
+        }
+    }
+    */
+
+    /* 전체 총합 출력 */
+    fprintf(rpt_fp, "\n");
+    fprintf(rpt_fp, "%s\n", RPT_SEP);
+    fprintf(rpt_fp, "  전체 합계\n");
+    fprintf(rpt_fp, "%s\n", RPT_SEP);
+    fprintf(rpt_fp, "  총 영업점수   : %d\n", br_count);
+    fprintf(rpt_fp, "  총 처리건수   : %d\n", grand_total_cnt);
+    fprintf(rpt_fp, "  총 정산금액   : %15.0f 원\n", grand_total_settle);
+    fprintf(rpt_fp, "  총 이자금액   : %15.0f 원\n", grand_total_int);
+    fprintf(rpt_fp, "  총 수수료     : %15.0f 원\n", grand_total_fee);
+    fprintf(rpt_fp, "  총 세금       : %15.0f 원\n", grand_total_tax);
+    fprintf(rpt_fp, "%s\n", RPT_SEP);
+
+    print_rpt_footer(rpt_fp);
+
+    goto RPT_CLEANUP;
+
+RPT_DB_ERR:
+    LOG_ERR(rpt_log_fp, "DB 접속 실패: sqlcode=%d %s", sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+    fprintf(stderr, "DB 접속 실패\n");
+    if(rpt_fp != NULL && rpt_fp != stdout) fclose(rpt_fp);
+    if(rpt_log_fp != NULL && rpt_log_fp != stderr) fclose(rpt_log_fp);
+    return ERR_DB_CONNECT;
+
+RPT_CLEANUP:
+    end_t = time(NULL);
+    LOG_MSG(rpt_log_fp, "RPT_DAILY 종료 — 소요시간: %ld초", (long)(end_t - start_t));
+
+    if(rpt_fp != NULL && rpt_fp != stdout) {
+        fclose(rpt_fp);
+        printf("리포트 생성 완료: %s\n", rpt_path);
+    }
+    if(rpt_log_fp != NULL && rpt_log_fp != stderr) fclose(rpt_log_fp);
+
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+    EXEC SQL COMMIT WORK RELEASE;
+
+    return ERR_SUCCESS;
+}
+
+
+/* ============================================= */
+/* gen_branch_report — 영업점별 정산 현황          */
+/* Oracle CONNECT BY 로 영업점 트리구조 조회       */
+/* 2011.03.10 박사원 추가                         */
+/* ============================================= */
+int gen_branch_report(char *batch_dt)
+{
+    int line_cnt = 0;
+    int page_no = 1;
+    char *type_nm;
+
+    strcpy(r_batch_dt, batch_dt);
+
+    /* 영업점 트리구조 + 정산 집계 — 쿼리가 좀 긴데 원래 이러함 */
+    EXEC SQL DECLARE c_br_rpt CURSOR FOR
+        SELECT  B.BR_CD,
+                B.BR_NM,
+                NVL(B.PARENT_BR_CD, '0000'),
+                B.BR_LEVEL,
+                NVL(S.TOTAL_CNT, 0),
+                NVL(S.TOTAL_SETTLE, 0),
+                NVL(S.TOTAL_INT, 0),
+                NVL(S.TOTAL_FEE, 0),
+                NVL(S.TOTAL_TAX, 0),
+                NVL(S.AVG_BAL, 0),
+                NVL(S.MAX_BAL, 0)
+        FROM    TB_BRANCH_MST B,
+                (SELECT BR_CD,
+                        COUNT(*) AS TOTAL_CNT,
+                        SUM(SETTLE_AMT) AS TOTAL_SETTLE,
+                        SUM(INT_AMT) AS TOTAL_INT,
+                        SUM(FEE_AMT) AS TOTAL_FEE,
+                        SUM(TAX_AMT) AS TOTAL_TAX,
+                        AVG(BAL_AMT) AS AVG_BAL,
+                        MAX(BAL_AMT) AS MAX_BAL
+                 FROM   TB_SETTLE_DAILY
+                 WHERE  SETTLE_DT = :r_batch_dt
+                 GROUP BY BR_CD) S
+        WHERE   B.BR_CD = S.BR_CD(+)
+        AND     B.USE_YN = 'Y'
+        START WITH B.PARENT_BR_CD IS NULL
+        CONNECT BY PRIOR B.BR_CD = B.PARENT_BR_CD
+        ORDER SIBLINGS BY B.BR_CD;
+
+    EXEC SQL OPEN c_br_rpt;
+    if(sqlca.sqlcode != 0) {
+        LOG_ERR(rpt_log_fp, "영업점 커서 오픈 실패: sqlcode=%d", sqlca.sqlcode);
+        return ERR_DB_CURSOR_OPEN;
+    }
+
+    /* 헤더 */
+    fprintf(rpt_fp, "%-4s %-20s %4s %8s %15s %15s %15s %15s %15s %15s\n",
+        "점코드", "영업점명", "레벨", "건수", "정산금액", "이자금액", "수수료", "세금", "평균잔액", "최고잔액");
+    fprintf(rpt_fp, "%s\n", RPT_LINE);
+
+    for(;;) {
+        EXEC SQL FETCH c_br_rpt INTO
+            :r_br_cd, :r_br_nm, :r_parent_br :r_parent_ind,
+            :r_br_level,
+            :r_total_cnt,
+            :r_total_settle :r_settle_ind,
+            :r_total_int :r_int_ind,
+            :r_total_fee :r_fee_ind,
+            :r_total_tax :r_tax_ind,
+            :r_avg_bal :r_avg_ind,
+            :r_max_bal :r_max_ind;
+
+        if(sqlca.sqlcode == 1403) break;
+        if(sqlca.sqlcode != 0) {
+            LOG_ERR(rpt_log_fp, "영업점 FETCH 오류: sqlcode=%d", sqlca.sqlcode);
+            break;
+        }
+
+        RTRIM(r_br_cd);
+        RTRIM(r_br_nm);
+
+        if(r_settle_ind == -1) r_total_settle = 0.0;
+        if(r_int_ind == -1) r_total_int = 0.0;
+        if(r_fee_ind == -1) r_total_fee = 0.0;
+        if(r_tax_ind == -1) r_total_tax = 0.0;
+        if(r_avg_ind == -1) r_avg_bal = 0.0;
+        if(r_max_ind == -1) r_max_bal = 0.0;
+
+        /* 들여쓰기 — 레벨에 따라 */
+        /* 레벨 1은 본부, 2는 지역본부, 3은 영업점 */
+        {
+            char indent[20];
+            int j;
+            memset(indent, ' ', sizeof(indent));
+            indent[0] = '\0';
+            for(j = 1; j < r_br_level && j < 10; j++) {
+                strcat(indent, "  ");
+            }
+
+            fprintf(rpt_fp, "%-4s %s%-*s %4d %8d %15.0f %15.0f %15.0f %15.0f %15.0f %15.0f\n",
+                r_br_cd, indent, (int)(20 - strlen(indent)), r_br_nm, r_br_level,
+                r_total_cnt, r_total_settle, r_total_int, r_total_fee, r_total_tax,
+                r_avg_bal, r_max_bal);
+        }
+
+        /* 총합 누적 — 말단 영업점(레벨3)만 합산해야 이중계산 안됨 */
+        if(r_br_level == 3) {
+            grand_total_cnt += r_total_cnt;
+            grand_total_settle += r_total_settle;
+            grand_total_int += r_total_int;
+            grand_total_fee += r_total_fee;
+            grand_total_tax += r_total_tax;
+            br_count++;
+        }
+
+        line_cnt++;
+        /* 페이지 넘김 — 60줄마다 */
+        if(line_cnt % 60 == 0) {
+            page_no++;
+            fprintf(rpt_fp, "\n--- Page %d ---\n\n", page_no);
+            fprintf(rpt_fp, "%-4s %-20s %4s %8s %15s %15s %15s %15s %15s %15s\n",
+                "점코드", "영업점명", "레벨", "건수", "정산금액", "이자금액", "수수료", "세금", "평균잔액", "최고잔액");
+            fprintf(rpt_fp, "%s\n", RPT_LINE);
+        }
+    }
+
+    EXEC SQL CLOSE c_br_rpt;
+
+    fprintf(rpt_fp, "%s\n", RPT_LINE);
+    fprintf(rpt_fp, "  영업점 수: %d\n", br_count);
+    fprintf(rpt_fp, "\n");
+
+    LOG_MSG(rpt_log_fp, "영업점별 리포트 완료: %d건", line_cnt);
+    return 0;
+}
+
+
+/* ============================================= */
+/* gen_grade_report — 고객등급별 통계              */
+/* 2016.01.15 최주임 추가                         */
+/* ============================================= */
+int gen_grade_report(char *batch_dt)
+{
+    int line_cnt = 0;
+    char *grade_nm;
+
+    strcpy(r_batch_dt, batch_dt);
+
+    /* 등급별 집계 — DECODE 사용 (Oracle 전용) */
+    EXEC SQL SELECT
+            NVL(SUM(DECODE(CUST_GRADE, 1, 1, 0)), 0),
+            NVL(SUM(DECODE(CUST_GRADE, 2, 1, 0)), 0),
+            NVL(SUM(DECODE(CUST_GRADE, 3, 1, 0)), 0),
+            NVL(SUM(DECODE(CUST_GRADE, 4, 1, 0)), 0),
+            NVL(SUM(DECODE(CUST_GRADE, 5, 1, 0)), 0),
+            NVL(SUM(DECODE(CUST_GRADE, 1, SETTLE_AMT, 0)), 0),
+            NVL(SUM(DECODE(CUST_GRADE, 2, SETTLE_AMT, 0)), 0),
+            NVL(SUM(DECODE(CUST_GRADE, 3, SETTLE_AMT, 0)), 0),
+            NVL(SUM(DECODE(CUST_GRADE, 4, SETTLE_AMT, 0)), 0),
+            NVL(SUM(DECODE(CUST_GRADE, 5, SETTLE_AMT, 0)), 0)
+        INTO
+            :r_grade1_cnt, :r_grade2_cnt, :r_grade3_cnt, :r_grade4_cnt, :r_grade5_cnt,
+            :r_grade1_amt, :r_grade2_amt, :r_grade3_amt, :r_grade4_amt, :r_grade5_amt
+        FROM TB_SETTLE_DAILY
+        WHERE SETTLE_DT = :r_batch_dt;
+
+    if(sqlca.sqlcode != 0 && sqlca.sqlcode != 1403) {
+        LOG_ERR(rpt_log_fp, "등급별 집계 오류: sqlcode=%d", sqlca.sqlcode);
+        return ERR_DB_EXECUTE;
+    }
+
+    fprintf(rpt_fp, "%-10s %10s %18s %12s\n", "등급", "건수", "정산금액", "건당평균");
+    fprintf(rpt_fp, "%s\n", RPT_LINE);
+
+    /* VIP */
+    fprintf(rpt_fp, "%-10s %10d %18.0f %12.0f\n", "1.VIP", r_grade1_cnt,
+        r_grade1_amt, r_grade1_cnt > 0 ? r_grade1_amt / r_grade1_cnt : 0);
+    /* GOLD */
+    fprintf(rpt_fp, "%-10s %10d %18.0f %12.0f\n", "2.GOLD", r_grade2_cnt,
+        r_grade2_amt, r_grade2_cnt > 0 ? r_grade2_amt / r_grade2_cnt : 0);
+    /* SILVER */
+    fprintf(rpt_fp, "%-10s %10d %18.0f %12.0f\n", "3.SILVER", r_grade3_cnt,
+        r_grade3_amt, r_grade3_cnt > 0 ? r_grade3_amt / r_grade3_cnt : 0);
+    /* BRONZE */
+    fprintf(rpt_fp, "%-10s %10d %18.0f %12.0f\n", "4.BRONZE", r_grade4_cnt,
+        r_grade4_amt, r_grade4_cnt > 0 ? r_grade4_amt / r_grade4_cnt : 0);
+    /* NORMAL */
+    fprintf(rpt_fp, "%-10s %10d %18.0f %12.0f\n", "5.NORMAL", r_grade5_cnt,
+        r_grade5_amt, r_grade5_cnt > 0 ? r_grade5_amt / r_grade5_cnt : 0);
+
+    fprintf(rpt_fp, "%s\n", RPT_LINE);
+    fprintf(rpt_fp, "%-10s %10d %18.0f\n", "합계",
+        r_grade1_cnt + r_grade2_cnt + r_grade3_cnt + r_grade4_cnt + r_grade5_cnt,
+        r_grade1_amt + r_grade2_amt + r_grade3_amt + r_grade4_amt + r_grade5_amt);
+    fprintf(rpt_fp, "\n");
+
+    LOG_MSG(rpt_log_fp, "고객등급별 리포트 완료");
+    return 0;
+}
+
+
+/* ============================================= */
+/* gen_type_report — 계좌유형별 통계               */
+/* ============================================= */
+int gen_type_report(char *batch_dt)
+{
+    char *type_names[] = {"", "보통예금", "적금", "정기예금", "자유적금",
+                          "기업당좌", "외화예금", "비대면계좌", "청약저축", "기타"};
+
+    strcpy(r_batch_dt, batch_dt);
+
+    EXEC SQL DECLARE c_type_rpt CURSOR FOR
+        SELECT  ACCT_TYPE,
+                COUNT(*),
+                NVL(SUM(SETTLE_AMT), 0),
+                NVL(SUM(INT_AMT), 0),
+                NVL(SUM(FEE_AMT), 0),
+                NVL(SUM(TAX_AMT), 0),
+                NVL(AVG(BAL_AMT), 0),
+                NVL(MAX(BAL_AMT), 0),
+                NVL(MIN(BAL_AMT), 0)
+        FROM    TB_SETTLE_DAILY
+        WHERE   SETTLE_DT = :r_batch_dt
+        GROUP BY ACCT_TYPE
+        ORDER BY ACCT_TYPE;
+
+    EXEC SQL OPEN c_type_rpt;
+    if(sqlca.sqlcode != 0) {
+        LOG_ERR(rpt_log_fp, "계좌유형 커서 오픈 실패: sqlcode=%d", sqlca.sqlcode);
+        return ERR_DB_CURSOR_OPEN;
+    }
+
+    fprintf(rpt_fp, "%-4s %-10s %8s %15s %15s %15s %15s %15s %15s %15s\n",
+        "유형", "유형명", "건수", "정산금액", "이자금액", "수수료", "세금", "평균잔액", "최고잔액", "최저잔액");
+    fprintf(rpt_fp, "%s\n", RPT_LINE);
+
+    for(;;) {
+        EXEC SQL FETCH c_type_rpt INTO
+            :r_acct_type, :r_total_cnt,
+            :r_total_settle :r_settle_ind,
+            :r_total_int :r_int_ind,
+            :r_total_fee :r_fee_ind,
+            :r_total_tax :r_tax_ind,
+            :r_avg_bal :r_avg_ind,
+            :r_max_bal :r_max_ind,
+            :r_min_bal :r_min_ind;
+
+        if(sqlca.sqlcode == 1403) break;
+        if(sqlca.sqlcode != 0) {
+            LOG_ERR(rpt_log_fp, "계좌유형 FETCH 오류: sqlcode=%d", sqlca.sqlcode);
+            break;
+        }
+
+        if(r_settle_ind == -1) r_total_settle = 0.0;
+        if(r_int_ind == -1) r_total_int = 0.0;
+        if(r_fee_ind == -1) r_total_fee = 0.0;
+        if(r_tax_ind == -1) r_total_tax = 0.0;
+        if(r_avg_ind == -1) r_avg_bal = 0.0;
+        if(r_max_ind == -1) r_max_bal = 0.0;
+        if(r_min_ind == -1) r_min_bal = 0.0;
+
+        {
+            char *tnm;
+            if(r_acct_type >= 1 && r_acct_type <= 9) {
+                tnm = type_names[r_acct_type];
+            } else {
+                tnm = "알수없음";
+            }
+
+            fprintf(rpt_fp, "%-4d %-10s %8d %15.0f %15.0f %15.0f %15.0f %15.0f %15.0f %15.0f\n",
+                r_acct_type, tnm, r_total_cnt,
+                r_total_settle, r_total_int, r_total_fee, r_total_tax,
+                r_avg_bal, r_max_bal, r_min_bal);
+        }
+    }
+
+    EXEC SQL CLOSE c_type_rpt;
+
+    fprintf(rpt_fp, "%s\n", RPT_LINE);
+    fprintf(rpt_fp, "\n");
+
+    LOG_MSG(rpt_log_fp, "계좌유형별 리포트 완료");
+    return 0;
+}
+
+
+/* ============================================= */
+/* gen_limit_report — 한도초과 현황                */
+/* 2019.04.30 정대리 추가                         */
+/* ============================================= */
+int gen_limit_report(char *batch_dt)
+{
+    int cnt = 0;
+    double total_over = 0.0;
+
+    EXEC SQL BEGIN DECLARE SECTION;
+        char    lh_acct_no[21];
+        char    lh_br_cd[5];
+        double  lh_bal;
+        double  lh_limit;
+        double  lh_over;
+        char    lh_batch_dt[9];
+    EXEC SQL END DECLARE SECTION;
+
+    strcpy(lh_batch_dt, batch_dt);
+
+    EXEC SQL DECLARE c_limit_rpt CURSOR FOR
+        SELECT  A.ACCT_NO, A.BR_CD, A.BAL_AMT, B.LIMIT_AMT,
+                A.BAL_AMT - B.LIMIT_AMT AS OVER_AMT
+        FROM    TB_ACCT_MST A, TB_ACCT_LIMIT B
+        WHERE   A.ACCT_NO = B.ACCT_NO
+        AND     A.BAL_AMT > B.LIMIT_AMT
+        AND     A.ACCT_STAT = 1
+        ORDER BY (A.BAL_AMT - B.LIMIT_AMT) DESC;
+
+    EXEC SQL OPEN c_limit_rpt;
+    if(sqlca.sqlcode != 0) {
+        LOG_ERR(rpt_log_fp, "한도초과 커서 오픈 실패: sqlcode=%d", sqlca.sqlcode);
+        return ERR_DB_CURSOR_OPEN;
+    }
+
+    fprintf(rpt_fp, "%-20s %-4s %18s %18s %18s\n",
+        "계좌번호", "점", "잔액", "한도", "초과금액");
+    fprintf(rpt_fp, "%s\n", RPT_LINE);
+
+    for(;;) {
+        EXEC SQL FETCH c_limit_rpt INTO
+            :lh_acct_no, :lh_br_cd, :lh_bal, :lh_limit, :lh_over;
+
+        if(sqlca.sqlcode == 1403) break;
+        if(sqlca.sqlcode != 0) {
+            LOG_ERR(rpt_log_fp, "한도초과 FETCH 오류: sqlcode=%d", sqlca.sqlcode);
+            break;
+        }
+
+        RTRIM(lh_acct_no);
+        RTRIM(lh_br_cd);
+
+        fprintf(rpt_fp, "%-20s %-4s %18.0f %18.0f %18.0f\n",
+            lh_acct_no, lh_br_cd, lh_bal, lh_limit, lh_over);
+
+        cnt++;
+        total_over += lh_over;
+
+        /* 상위 100건만 출력 */
+        if(cnt >= 100) {
+            fprintf(rpt_fp, "  ... 이하 생략 (상위 100건만 표시)\n");
+            break;
+        }
+    }
+
+    EXEC SQL CLOSE c_limit_rpt;
+
+    fprintf(rpt_fp, "%s\n", RPT_LINE);
+    fprintf(rpt_fp, "  한도초과 건수: %d  총 초과금액: %.0f 원\n", cnt, total_over);
+    fprintf(rpt_fp, "\n");
+
+    LOG_MSG(rpt_log_fp, "한도초과 리포트 완료: %d건 총초과=%.0f", cnt, total_over);
+    return 0;
+}
+
+
+/* ============================================= */
+/* print_rpt_header                              */
+/* ============================================= */
+void print_rpt_header(FILE *fp, char *batch_dt, char *title)
+{
+    time_t t = time(NULL);
+    struct tm *tm_ptr = localtime(&t);
+    char dt_str[20];
+
+    sprintf(dt_str, "%04d-%02d-%02d %02d:%02d:%02d",
+        tm_ptr->tm_year+1900, tm_ptr->tm_mon+1, tm_ptr->tm_mday,
+        tm_ptr->tm_hour, tm_ptr->tm_min, tm_ptr->tm_sec);
+
+    fprintf(fp, "\n");
+    fprintf(fp, "%s\n", RPT_SEP);
+    fprintf(fp, "  %-40s                     배치일자: %s\n", title, batch_dt);
+    fprintf(fp, "  %-40s                     출력일시: %s\n", "", dt_str);
+    fprintf(fp, "%s\n", RPT_SEP);
+}
+
+/* ============================================= */
+/* print_rpt_footer                              */
+/* ============================================= */
+void print_rpt_footer(FILE *fp)
+{
+    fprintf(fp, "\n");
+    fprintf(fp, "%s\n", RPT_SEP);
+    fprintf(fp, "  본 리포트는 일일정산배치(SETTLE_BAT) 처리결과를 기반으로 생성되었습니다.\n");
+    fprintf(fp, "  문의: 정보시스템부 배치운영팀 (내선 5678)\n");
+    fprintf(fp, "%s\n", RPT_SEP);
+    fprintf(fp, "\n");
+}
+
+
+/*
+ * 2021.06.11 박과장 — CSV 리포트
+ * 만들다가 말았음. 다음 분기에 하기로 했는데 아직도 안함
+ *
+int gen_csv_report(char *batch_dt, char *out_path)
+{
+    FILE *csv_fp;
+    int cnt = 0;
+
+    csv_fp = fopen(out_path, "w");
+    if(csv_fp == NULL) {
+        LOG_ERR(rpt_log_fp, "CSV 파일 오픈 실패: %s", out_path);
+        return ERR_FILE_OPEN;
+    }
+
+    // 헤더
+    fprintf(csv_fp, "영업점코드,영업점명,처리건수,정산금액,이자금액,수수료,세금\n");
+
+    // TODO: 데이터 쿼리 추가
+    // EXEC SQL DECLARE ...
+    // for(;;) { ... }
+
+    fclose(csv_fp);
+    return 0;
+}
+*/
+
+/* ============================================= */
+/* END OF RPT_DAILY.pc                           */
+/* ============================================= */

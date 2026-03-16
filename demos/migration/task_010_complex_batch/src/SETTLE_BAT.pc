@@ -1,0 +1,1493 @@
+/* ============================================= */
+/* 프로그램명 : SETTLE_BAT                        */
+/* 설    명 : 일일 정산 배치 프로그램              */
+/* 작 성 자 : 홍길동                              */
+/* 작 성 일 : 2008.03.15                          */
+/* 수 정 이 력 :                                  */
+/*   2010.06.20 이과장 - 우대금리 적용 추가       */
+/*   2013.05.15 김대리 - 수수료 계산 변경         */
+/*   2015.11.03 박사원 - 휴면계좌 예외처리 추가   */
+/*   2018.09.21 박과장 - 신규 계좌유형 추가       */
+/*   2020.02.10 최주임 - 코로나 이자감면 로직     */
+/*   2022.08.15 정대리 - 한도초과 체크 추가       */
+/* ============================================= */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include "common_def.h"
+
+EXEC SQL INCLUDE sqlca;
+
+/* ============================================= */
+/* 호스트 변수 선언부                              */
+/* 전역으로 선언 — 어디서든 접근 가능              */
+/* 변수 늘어날때마다 여기에 추가함                  */
+/* ============================================= */
+EXEC SQL BEGIN DECLARE SECTION;
+	char    g_batch_dt[9];          /* YYYYMMDD 배치일자 */
+	char    g_br_cd[5];             /* 영업점코드 */
+	char    g_acct_no[21];          /* 계좌번호 */
+	char    g_acct_nm[101];         /* 계좌명(고객명) */
+	int     g_acct_stat;            /* 계좌상태 */
+	int     g_acct_type;            /* 계좌유형 */
+	double  g_bal_amt;              /* 잔액 */
+	double  g_avail_amt;            /* 가용잔액 */
+	double  g_hold_amt;             /* 보류금액 */
+	double  g_int_rate;             /* 이자율 */
+	double  g_spc_rate;             /* 우대금리 — 2010.06.20 이과장 추가 */
+	double  g_fee_amt;              /* 수수료 */
+	double  g_fee_rate;             /* 수수료율 */
+	double  g_settle_amt;           /* 정산금액 */
+	double  g_int_amt;              /* 이자금액 */
+	double  g_tax_amt;              /* 세금 */
+	double  g_penalty_amt;          /* 위약금 */
+	char    g_open_dt[9];           /* 개설일자 */
+	char    g_close_dt[9];          /* 해지일자 */
+	char    g_last_txn_dt[9];       /* 최종거래일 */
+	char    g_settle_type[3];       /* 정산유형 */
+	char    g_product_cd[11];       /* 상품코드 — 2018.09.21 박과장 추가 */
+	int     g_cust_grade;           /* 고객등급 */
+	int     g_fee_exempt_yn;        /* 수수료면제여부 */
+	int     g_txn_cnt;              /* 거래건수 */
+	double  g_txn_amt;              /* 거래금액 — 이거 거래별 금액인데 합계로도 씀 */
+	char    g_txn_dt[9];            /* 거래일자 */
+	char    g_txn_type[3];          /* 거래유형 */
+	int     g_settle_seq;           /* 정산순번 */
+	char    g_db_uid[31];           /* DB 접속 ID */
+	char    g_db_pwd[31];           /* DB 접속 PW */
+	char    g_db_sid[31];           /* DB SID */
+	int     g_new_acct_type;        /* 신규계좌유형 — 2018.09.21 박과장 */
+	double  g_covid_rate;           /* 코로나감면율 — 2020.02.10 최주임 */
+	double  g_limit_amt;            /* 한도금액 — 2022.08.15 정대리 */
+	double  g_over_amt;             /* 한도초과금액 */
+	char    g_err_sql_msg[256];     /* SQL 에러 메시지 */
+	short   g_bal_ind;              /* 잔액 indicator */
+	short   g_rate_ind;             /* 이자율 indicator */
+	short   g_spc_rate_ind;         /* 우대금리 indicator */
+	short   g_fee_ind;              /* 수수료 indicator */
+	short   g_txn_amt_ind;          /* 거래금액 indicator */
+	short   g_hold_ind;             /* 보류금 indicator */
+	short   g_close_dt_ind;         /* 해지일자 indicator */
+	short   g_covid_ind;            /* 코로나감면율 indicator */
+	short   g_limit_ind;            /* 한도금액 indicator */
+	short   g_product_ind;          /* 상품코드 indicator */
+EXEC SQL END DECLARE SECTION;
+
+/* ============================================= */
+/* 전역변수 — 호스트변수 아닌것들                  */
+/* ============================================= */
+int g_total_cnt = 0;
+int g_succ_cnt = 0;
+int g_err_cnt = 0;
+int g_skip_cnt = 0;
+int g_commit_unit = COMMIT_UNIT;
+int g_debug_mode = 0;
+FILE *g_log_fp = NULL;
+FILE *g_err_fp = NULL;
+char g_log_path[MAX_PATH_LEN];
+char g_err_path[MAX_PATH_LEN];
+char g_err_msg[MAX_ERR_MSG];
+char g_job_type[3];             /* 01:전체 02:영업점 03:재처리 */
+double g_total_settle = 0.0;
+double g_total_interest = 0.0;
+double g_total_fee = 0.0;
+double g_total_tax = 0.0;
+int g_limit_over_cnt = 0;       /* 2022.08.15 정대리 */
+double g_limit_over_total = 0.0;
+time_t g_start_time;
+time_t g_end_time;
+
+/* 이자율 테이블 — 하드코딩. DB에도 있는데 여기서도 관리함 (이중관리) */
+/* 2010.06.20 이과장 - 우대금리 추가해서 더 복잡해짐 */
+static double base_rate_tbl[10] = {0.0, 1.5, 2.0, 2.5, 3.0, 3.5, 2.0, 1.0, 0.5, 0.0};
+static double spc_rate_tbl[6] = {0.0, 0.5, 1.0, 1.5, 2.0, 2.5};
+
+/* ============================================= */
+/* 함수 프로토타입                                */
+/* ============================================= */
+int calc_interest(char *acct_no, int acct_type, double bal, double rate, double spc_rate, int cust_grade, char *open_dt, double *result);
+int calc_fee(char *acct_no, int acct_type, double bal, int txn_cnt, int cust_grade, int fee_exempt, double *fee_amt);
+int proc_settlement(char *acct_no, double settle_amt, char *settle_type, char *batch_dt);
+void print_summary(void);
+
+/* ============================================= */
+/* 시그널 핸들러                                  */
+/* ============================================= */
+void sig_handler(int signo)
+{
+    LOG_ERR(g_err_fp, "시그널 수신: %d — 배치 비정상 종료", signo);
+    LOG_MSG(g_log_fp, "SIGNAL %d received. 긴급 종료 처리 시작...", signo);
+
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+    EXEC SQL ROLLBACK WORK;
+
+    print_summary();
+
+    if(g_log_fp != NULL) fclose(g_log_fp);
+    if(g_err_fp != NULL) fclose(g_err_fp);
+
+    EXEC SQL COMMIT WORK RELEASE;
+    exit(1);
+}
+
+/* ============================================= */
+/*                                               */
+/*   여기서부터 메인 로직                         */
+/*   주의: 이 함수 수정시 반드시 담당자 확인 후    */
+/*         수정할 것!!!                           */
+/*                                               */
+/* ============================================= */
+int main(int argc, char *argv[])
+{
+    int     i, rc;
+    int     retry_cnt;
+    char    tmp_buf[MAX_MSG_LEN];
+    char    sql_buf[MAX_SQL_LEN];
+    char    dt_buf[9];
+    double  tmp_amt;
+    double  tmp_rate;
+    double  calc_result;
+    double  fee_result;
+    int     days_diff;
+    int     is_holiday;
+    int     inner_cnt;
+    char    log_filename[MAX_PATH_LEN];
+    char    err_filename[MAX_PATH_LEN];
+    struct tm *tm_ptr;
+    time_t  cur_time;
+    int     yr, mn, dy;
+    double  daily_int;
+    double  accum_int;
+    double  adj_rate;
+    int     covid_flag = 0;         /* 2020.02.10 최주임 */
+    double  covid_discount = 0.0;
+    int     limit_check = 0;        /* 2022.08.15 정대리 */
+    char    prev_br_cd[5];
+
+    g_start_time = time(NULL);
+
+    /* =========================================== */
+    /* 인자 파싱                                    */
+    /* 사용법: SETTLE_BAT YYYYMMDD [BR_CD] [JOB_TYPE] [COMMIT_UNIT] [DEBUG] */
+    /* =========================================== */
+    if(argc < 2) {
+        fprintf(stderr, "사용법: %s YYYYMMDD [BR_CD] [JOB_TYPE] [COMMIT_UNIT] [DEBUG]\n", argv[0]);
+        fprintf(stderr, "  YYYYMMDD   : 배치처리일자\n");
+        fprintf(stderr, "  BR_CD      : 영업점코드 (생략시 전체)\n");
+        fprintf(stderr, "  JOB_TYPE   : 01=전체, 02=영업점별, 03=재처리\n");
+        fprintf(stderr, "  COMMIT_UNIT: 커밋단위 (기본 100)\n");
+        fprintf(stderr, "  DEBUG      : 1=디버그모드\n");
+        return ERR_PARAM_MISSING;
+    }
+
+    /* 배치일자 */
+    memset(g_batch_dt, 0x00, sizeof(g_batch_dt));
+    strncpy(g_batch_dt, argv[1], 8);
+    g_batch_dt[8] = '\0';
+
+    if(!IS_VALID_DATE(g_batch_dt)) {
+        fprintf(stderr, "에러: 일자형식 오류 [%s]\n", g_batch_dt);
+        return ERR_PARAM_DATE;
+    }
+
+    /* 영업점코드 */
+    memset(g_br_cd, 0x00, sizeof(g_br_cd));
+    if(argc >= 3 && strlen(argv[2]) > 0) {
+        strncpy(g_br_cd, argv[2], 4);
+    } else {
+        strcpy(g_br_cd, "ALL");
+    }
+
+    /* JOB_TYPE */
+    memset(g_job_type, 0x00, sizeof(g_job_type));
+    if(argc >= 4) {
+        strncpy(g_job_type, argv[3], 2);
+    } else {
+        strcpy(g_job_type, "01");
+    }
+
+    /* COMMIT_UNIT */
+    if(argc >= 5) {
+        g_commit_unit = atoi(argv[4]);
+        if(g_commit_unit <= 0) g_commit_unit = COMMIT_UNIT;
+    }
+
+    /* DEBUG MODE */
+    if(argc >= 6) {
+        g_debug_mode = atoi(argv[5]);
+    }
+
+    /* =========================================== */
+    /* 로그 파일 오픈                               */
+    /* =========================================== */
+    sprintf(log_filename, "/app/batch/log/SETTLE_BAT_%s.log", g_batch_dt);
+    sprintf(err_filename, "/app/batch/log/SETTLE_BAT_%s.err", g_batch_dt);
+
+    g_log_fp = fopen(log_filename, "a");
+    if(g_log_fp == NULL) {
+        /* 로그파일 못열면 stdout으로 */
+        g_log_fp = stdout;
+        fprintf(stderr, "경고: 로그파일 오픈 실패 [%s] — stdout 사용\n", log_filename);
+    }
+
+    g_err_fp = fopen(err_filename, "a");
+    if(g_err_fp == NULL) {
+        g_err_fp = stderr;
+    }
+
+    LOG_MSG(g_log_fp, "========================================");
+    LOG_MSG(g_log_fp, "SETTLE_BAT 시작");
+    LOG_MSG(g_log_fp, "배치일자 : %s", g_batch_dt);
+    LOG_MSG(g_log_fp, "영업점   : %s", g_br_cd);
+    LOG_MSG(g_log_fp, "작업유형 : %s", g_job_type);
+    LOG_MSG(g_log_fp, "커밋단위 : %d", g_commit_unit);
+    LOG_MSG(g_log_fp, "디버그   : %d", g_debug_mode);
+    LOG_MSG(g_log_fp, "========================================");
+
+    /* 시그널 핸들러 등록 */
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+    /* signal(SIGPIPE, SIG_IGN); */  /* 2014년에 추가했다가 뺐음 */
+
+    /* =========================================== */
+    /* DB 접속                                     */
+    /* 환경변수에서 접속정보 가져옴                  */
+    /* =========================================== */
+    memset(g_db_uid, 0x00, sizeof(g_db_uid));
+    memset(g_db_pwd, 0x00, sizeof(g_db_pwd));
+    memset(g_db_sid, 0x00, sizeof(g_db_sid));
+
+    if(getenv("ORACLE_UID") != NULL) {
+        strcpy(g_db_uid, getenv("ORACLE_UID"));
+    } else {
+        strcpy(g_db_uid, "BATCH_USER");  /* 하드코딩 기본값 */
+    }
+    if(getenv("ORACLE_PWD") != NULL) {
+        strcpy(g_db_pwd, getenv("ORACLE_PWD"));
+    } else {
+        strcpy(g_db_pwd, "batch1234");   /* 하드코딩 비번... 보안팀 모르게 */
+    }
+    if(getenv("ORACLE_SID") != NULL) {
+        strcpy(g_db_sid, getenv("ORACLE_SID"));
+    } else {
+        strcpy(g_db_sid, "PRODDB");
+    }
+
+    EXEC SQL WHENEVER SQLERROR GOTO DB_CONN_ERR;
+
+    EXEC SQL CONNECT :g_db_uid IDENTIFIED BY :g_db_pwd USING :g_db_sid;
+
+    LOG_MSG(g_log_fp, "DB 접속 성공 [%s@%s]", g_db_uid, g_db_sid);
+
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+    /* =========================================== */
+    /* 배치 파라미터 검증                           */
+    /* TB_BATCH_CTL 테이블에서 배치 실행 가능 여부 확인 */
+    /* =========================================== */
+    EXEC SQL SELECT COUNT(*) INTO :g_txn_cnt
+        FROM TB_BATCH_CTL
+        WHERE BATCH_ID = 'SETTLE_BAT'
+        AND   BATCH_DT = :g_batch_dt
+        AND   BATCH_STAT IN ('R', 'E');    /* R:대기, E:에러(재처리) */
+
+    if(sqlca.sqlcode != 0) {
+        LOG_ERR(g_err_fp, "배치 제어 테이블 조회 실패: sqlcode=%d", sqlca.sqlcode);
+        goto CLEANUP;
+    }
+
+    /* g_txn_cnt 여기서는 배치 건수 체크용으로 재활용 — 원래는 거래건수용 */
+    if(g_txn_cnt == 0 && strcmp(g_job_type, "03") != 0) {
+        LOG_ERR(g_err_fp, "처리 대상 배치 없음 (BATCH_DT=%s)", g_batch_dt);
+        goto CLEANUP;
+    }
+
+    /* 배치 상태를 '처리중'으로 변경 */
+    EXEC SQL UPDATE TB_BATCH_CTL
+        SET BATCH_STAT = 'P',          /* P:처리중 */
+            START_DT = SYSDATE,
+            UPD_DT = SYSDATE
+        WHERE BATCH_ID = 'SETTLE_BAT'
+        AND   BATCH_DT = :g_batch_dt;
+
+    EXEC SQL COMMIT;
+
+    LOG_MSG(g_log_fp, "배치 상태 변경 완료 (P:처리중)");
+
+    /* =========================================== */
+    /* 코로나 감면 기간 체크                        */
+    /* 2020.02.10 최주임 추가                       */
+    /* TODO: 이거 나중에 정리해야함 ㅠㅠ - 2016.03  */
+    /*       ↑ 위 TODO는 다른건데 여기 남아있음     */
+    /* =========================================== */
+    if(strcmp(g_batch_dt, "20200301") >= 0 && strcmp(g_batch_dt, "20231231") <= 0) {
+        covid_flag = 1;
+        EXEC SQL SELECT NVL(EXEMPT_RATE, 0)
+            INTO :g_covid_rate :g_covid_ind
+            FROM TB_COVID_EXEMPT
+            WHERE :g_batch_dt BETWEEN START_DT AND END_DT
+            AND   USE_YN = 'Y'
+            AND   ROWNUM = 1;
+
+        if(sqlca.sqlcode == 1403 || g_covid_ind == -1) {
+            covid_flag = 0;
+            g_covid_rate = 0.0;
+            LOG_MSG(g_log_fp, "코로나 감면 해당없음");
+        } else if(sqlca.sqlcode != 0) {
+            LOG_ERR(g_err_fp, "코로나 감면 조회 오류: sqlcode=%d", sqlca.sqlcode);
+            covid_flag = 0;
+            g_covid_rate = 0.0;
+        } else {
+            LOG_MSG(g_log_fp, "코로나 감면율 적용: %.2f%%", g_covid_rate);
+        }
+    }
+
+    /* =========================================== */
+    /* 메인 커서 선언                               */
+    /* 계좌 마스터 + 상품 + 고객 3개 테이블 조인    */
+    /* =========================================== */
+    if(strcmp(g_br_cd, "ALL") == 0) {
+        /* 전체 영업점 */
+        EXEC SQL DECLARE c_acct CURSOR FOR
+            SELECT  A.ACCT_NO,
+                    A.ACCT_NM,
+                    A.BR_CD,
+                    A.ACCT_STAT,
+                    A.ACCT_TYPE,
+                    NVL(A.BAL_AMT, 0),
+                    NVL(A.AVAIL_AMT, 0),
+                    NVL(A.HOLD_AMT, 0),
+                    NVL(B.BASE_RATE, 0),
+                    NVL(B.SPC_RATE, 0),
+                    A.OPEN_DT,
+                    NVL(A.CLOSE_DT, '99991231'),
+                    NVL(A.LAST_TXN_DT, A.OPEN_DT),
+                    NVL(C.CUST_GRADE, 5),
+                    NVL(A.FEE_EXEMPT_YN, 0),
+                    NVL(A.NEW_ACCT_TYPE, 0),
+                    NVL(B.PRODUCT_CD, '0000000000'),
+                    NVL(D.LIMIT_AMT, 99999999999)
+            FROM    TB_ACCT_MST A,
+                    TB_PRODUCT_MST B,
+                    TB_CUST_MST C,
+                    TB_ACCT_LIMIT D
+            WHERE   A.PRODUCT_CD = B.PRODUCT_CD(+)
+            AND     A.CUST_NO = C.CUST_NO(+)
+            AND     A.ACCT_NO = D.ACCT_NO(+)
+            AND     A.ACCT_STAT IN (1, 2, 3)
+            AND     A.CLOSE_DT IS NULL
+            AND     A.OPEN_DT <= :g_batch_dt
+            ORDER BY A.BR_CD, A.ACCT_NO;
+    } else {
+        /* 특정 영업점 */
+        EXEC SQL DECLARE c_acct_br CURSOR FOR
+            SELECT  A.ACCT_NO,
+                    A.ACCT_NM,
+                    A.BR_CD,
+                    A.ACCT_STAT,
+                    A.ACCT_TYPE,
+                    NVL(A.BAL_AMT, 0),
+                    NVL(A.AVAIL_AMT, 0),
+                    NVL(A.HOLD_AMT, 0),
+                    NVL(B.BASE_RATE, 0),
+                    NVL(B.SPC_RATE, 0),
+                    A.OPEN_DT,
+                    NVL(A.CLOSE_DT, '99991231'),
+                    NVL(A.LAST_TXN_DT, A.OPEN_DT),
+                    NVL(C.CUST_GRADE, 5),
+                    NVL(A.FEE_EXEMPT_YN, 0),
+                    NVL(A.NEW_ACCT_TYPE, 0),
+                    NVL(B.PRODUCT_CD, '0000000000'),
+                    NVL(D.LIMIT_AMT, 99999999999)
+            FROM    TB_ACCT_MST A,
+                    TB_PRODUCT_MST B,
+                    TB_CUST_MST C,
+                    TB_ACCT_LIMIT D
+            WHERE   A.PRODUCT_CD = B.PRODUCT_CD(+)
+            AND     A.CUST_NO = C.CUST_NO(+)
+            AND     A.ACCT_NO = D.ACCT_NO(+)
+            AND     A.BR_CD = :g_br_cd
+            AND     A.ACCT_STAT IN (1, 2, 3)
+            AND     A.CLOSE_DT IS NULL
+            AND     A.OPEN_DT <= :g_batch_dt
+            ORDER BY A.ACCT_NO;
+    }
+
+    /* 커서 오픈 */
+    if(strcmp(g_br_cd, "ALL") == 0) {
+        EXEC SQL OPEN c_acct;
+    } else {
+        EXEC SQL OPEN c_acct_br;
+    }
+    if(sqlca.sqlcode != 0) {
+        LOG_ERR(g_err_fp, "커서 오픈 실패: sqlcode=%d", sqlca.sqlcode);
+        sprintf(g_err_msg, "CURSOR OPEN FAILED: %d", sqlca.sqlcode);
+        goto CLEANUP;
+    }
+
+    LOG_MSG(g_log_fp, "메인 커서 오픈 완료");
+
+    memset(prev_br_cd, 0x00, sizeof(prev_br_cd));
+
+    /* =========================================== */
+    /* 메인 루프 시작                               */
+    /* 아래 코드 건들지 마세요!! - 박과장 2018.09.21 */
+    /* =========================================== */
+    for(;;) {
+        /* 초기화 */
+        memset(g_acct_no, 0x00, sizeof(g_acct_no));
+        memset(g_acct_nm, 0x00, sizeof(g_acct_nm));
+        memset(g_open_dt, 0x00, sizeof(g_open_dt));
+        memset(g_close_dt, 0x00, sizeof(g_close_dt));
+        memset(g_last_txn_dt, 0x00, sizeof(g_last_txn_dt));
+        memset(g_product_cd, 0x00, sizeof(g_product_cd));
+        g_bal_amt = 0.0;
+        g_avail_amt = 0.0;
+        g_hold_amt = 0.0;
+        g_int_rate = 0.0;
+        g_spc_rate = 0.0;
+        g_fee_amt = 0.0;
+        g_settle_amt = 0.0;
+        g_int_amt = 0.0;
+        g_tax_amt = 0.0;
+        g_penalty_amt = 0.0;
+        g_bal_ind = 0;
+        g_rate_ind = 0;
+        g_spc_rate_ind = 0;
+        calc_result = 0.0;
+        fee_result = 0.0;
+
+        /* FETCH */
+        if(strcmp(g_br_cd, "ALL") == 0) {
+            EXEC SQL FETCH c_acct INTO
+                :g_acct_no, :g_acct_nm, :g_br_cd, :g_acct_stat, :g_acct_type,
+                :g_bal_amt :g_bal_ind, :g_avail_amt, :g_hold_amt :g_hold_ind,
+                :g_int_rate :g_rate_ind, :g_spc_rate :g_spc_rate_ind,
+                :g_open_dt, :g_close_dt :g_close_dt_ind, :g_last_txn_dt,
+                :g_cust_grade, :g_fee_exempt_yn, :g_new_acct_type,
+                :g_product_cd :g_product_ind, :g_limit_amt :g_limit_ind;
+        } else {
+            EXEC SQL FETCH c_acct_br INTO
+                :g_acct_no, :g_acct_nm, :g_br_cd, :g_acct_stat, :g_acct_type,
+                :g_bal_amt :g_bal_ind, :g_avail_amt, :g_hold_amt :g_hold_ind,
+                :g_int_rate :g_rate_ind, :g_spc_rate :g_spc_rate_ind,
+                :g_open_dt, :g_close_dt :g_close_dt_ind, :g_last_txn_dt,
+                :g_cust_grade, :g_fee_exempt_yn, :g_new_acct_type,
+                :g_product_cd :g_product_ind, :g_limit_amt :g_limit_ind;
+        }
+
+        if(sqlca.sqlcode == 1403) break;  /* 데이터 없음 — 루프 종료 */
+        if(sqlca.sqlcode != 0) {
+            sprintf(g_err_msg, "FETCH 오류: sqlcode=%d, sqlerrm=%s", sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+            goto ERR_HANDLE;
+        }
+
+        g_total_cnt++;
+        RTRIM(g_acct_no);
+        RTRIM(g_acct_nm);
+        RTRIM(g_product_cd);
+
+        /* NULL indicator 처리 */
+        if(g_bal_ind == -1) g_bal_amt = 0.0;
+        if(g_rate_ind == -1) g_int_rate = 0.0;
+        if(g_spc_rate_ind == -1) g_spc_rate = 0.0;
+        if(g_hold_ind == -1) g_hold_amt = 0.0;
+        if(g_limit_ind == -1) g_limit_amt = 99999999999.0;
+
+        LOG_DBG(g_log_fp, g_debug_mode, "처리중: [%s] %s bal=%.0f rate=%.4f", g_acct_no, g_acct_nm, g_bal_amt, g_int_rate);
+
+        /* 영업점 변경 로그 */
+        if(strcmp(prev_br_cd, g_br_cd) != 0) {
+            if(strlen(prev_br_cd) > 0) {
+                LOG_MSG(g_log_fp, "영업점 [%s] 처리 완료", prev_br_cd);
+            }
+            LOG_MSG(g_log_fp, "영업점 [%s] 처리 시작", g_br_cd);
+            strcpy(prev_br_cd, g_br_cd);
+        }
+
+        /* SAVEPOINT 설정 */
+        EXEC SQL SAVEPOINT sp_acct;
+
+        /* =========================================== */
+        /* 계좌 상태별 처리 분기                        */
+        /* =========================================== */
+        if(g_acct_stat == 1) {
+            /* 정상계좌 — 모든 정산 수행 */
+        } else if(g_acct_stat == 2) {
+            /* 정지계좌 — 이자만 계산, 수수료 면제 */
+            g_fee_exempt_yn = 1;
+            LOG_MSG(g_log_fp, "정지계좌: %s — 수수료 면제 적용", g_acct_no);
+        } else if(g_acct_stat == 3) {
+            /* 2015.11.03 박사원 - 휴면계좌 예외처리 추가 */
+            /* 휴면계좌 — 최종거래일 기준 1년 경과 확인 */
+
+            /* 날짜 차이 계산 — 대충 함 */
+            yr = (g_batch_dt[0]-'0')*1000 + (g_batch_dt[1]-'0')*100 + (g_batch_dt[2]-'0')*10 + (g_batch_dt[3]-'0');
+            mn = (g_batch_dt[4]-'0')*10 + (g_batch_dt[5]-'0');
+            dy = (g_batch_dt[6]-'0')*10 + (g_batch_dt[7]-'0');
+            days_diff = yr * 365 + mn * 30 + dy;
+
+            yr = (g_last_txn_dt[0]-'0')*1000 + (g_last_txn_dt[1]-'0')*100 + (g_last_txn_dt[2]-'0')*10 + (g_last_txn_dt[3]-'0');
+            mn = (g_last_txn_dt[4]-'0')*10 + (g_last_txn_dt[5]-'0');
+            dy = (g_last_txn_dt[6]-'0')*10 + (g_last_txn_dt[7]-'0');
+            days_diff = days_diff - (yr * 365 + mn * 30 + dy);
+
+            if(days_diff > 365) {
+                LOG_MSG(g_log_fp, "장기휴면: %s — %d일 경과, SKIP", g_acct_no, days_diff);
+                goto SKIP_ACCT;
+            }
+            /* 단기 휴면은 이자만 계산 */
+            g_fee_exempt_yn = 1;
+        } else {
+            /* 알수없는 상태 */
+            sprintf(g_err_msg, "알수없는 계좌상태: stat=%d", g_acct_stat);
+            LOG_ERR(g_err_fp, "%s [%s]", g_err_msg, g_acct_no);
+            goto SKIP_ACCT;
+        }
+
+        /* =========================================== */
+        /* 잔액 체크                                   */
+        /* =========================================== */
+        if(g_bal_amt < 0) {
+            /* 마이너스 잔액 — 뭔가 잘못된거지만 일단 처리 */
+            LOG_ERR(g_err_fp, "마이너스 잔액: %s bal=%.0f", g_acct_no, g_bal_amt);
+            /* 2013.05.15 김대리 - 마이너스 잔액도 처리하도록 변경 */
+            /* goto SKIP_ACCT; */  /* 원래는 스킵했음 */
+        }
+        if(g_bal_amt == 0 && g_acct_stat == 1) {
+            /* 잔액 0 정상계좌 — 수수료만 계산 */
+            goto CALC_FEE_ONLY;
+        }
+
+        /* =========================================== */
+        /* 이자 계산 — 인라인 로직                      */
+        /* 아... 함수로 빼놓고도 여기서 또 계산함        */
+        /* calc_interest() 호출하는 부분이랑 중복임      */
+        /* =========================================== */
+
+        /* 2022.08.15 정대리 - 한도초과 체크 추가 */
+        if(g_bal_amt > g_limit_amt) {
+            g_over_amt = g_bal_amt - g_limit_amt;
+            g_limit_over_cnt++;
+            g_limit_over_total += g_over_amt;
+            LOG_MSG(g_log_fp, "한도초과: %s 잔액=%.0f 한도=%.0f 초과=%.0f", g_acct_no, g_bal_amt, g_limit_amt, g_over_amt);
+
+            /* 한도초과 내역 INSERT */
+            EXEC SQL INSERT INTO TB_LIMIT_OVER_LOG
+                (ACCT_NO, CHECK_DT, BAL_AMT, LIMIT_AMT, OVER_AMT, REG_DT)
+            VALUES
+                (:g_acct_no, :g_batch_dt, :g_bal_amt, :g_limit_amt, :g_over_amt, SYSDATE);
+            if(sqlca.sqlcode != 0 && sqlca.sqlcode != -1) {  /* -1: 중복키 무시 */
+                LOG_ERR(g_err_fp, "한도초과 로그 INSERT 실패: %s sqlcode=%d", g_acct_no, sqlca.sqlcode);
+                /* 에러여도 계속 처리 */
+            }
+        }
+
+        /* 기본 이자 계산 */
+        /* 계좌유형별 이자율 결정 — 하드코딩 테이블 사용 */
+        if(g_acct_type >= 1 && g_acct_type <= 9) {
+            tmp_rate = base_rate_tbl[g_acct_type];
+        } else {
+            tmp_rate = 0.0;
+            LOG_ERR(g_err_fp, "알수없는 계좌유형: %s type=%d", g_acct_no, g_acct_type);
+        }
+
+        /* DB에서 가져온 이자율이 있으면 그걸 씀 */
+        if(g_int_rate > 0) {
+            tmp_rate = g_int_rate;
+        }
+
+        /* 2010.06.20 이과장 - 우대금리 적용 */
+        adj_rate = tmp_rate;
+        if(g_spc_rate > 0 && g_cust_grade <= 3) {
+            adj_rate = tmp_rate + g_spc_rate;
+            LOG_DBG(g_log_fp, g_debug_mode, "우대금리 적용: %s base=%.4f spc=%.4f total=%.4f", g_acct_no, tmp_rate, g_spc_rate, adj_rate);
+        } else if(g_cust_grade == 1) {
+            /* VIP는 무조건 우대 0.5% 추가 */
+            if(g_spc_rate <= 0) {
+                adj_rate = tmp_rate + 0.5;
+            }
+        }
+
+        /* 2020.02.10 최주임 - 코로나 감면 */
+        if(covid_flag && g_covid_rate > 0) {
+            /* 감면 = 이자 줄여주는거니까 금리를 올려줘야... 아니 줄여야하나? */
+            /* 확인결과: 이자 감면이 아니라 수수료 감면이었음 */
+            /* 근데 이자도 좀 깎아달라고 해서 0.1% 추가 감면 */
+            if(g_acct_type == 1 || g_acct_type == 2) {
+                covid_discount = 0.1;
+                adj_rate = adj_rate - covid_discount;
+                if(adj_rate < 0) adj_rate = 0;
+            }
+        }
+
+        /* 일수 계산 — 배치일 - 전일(=1일) */
+        /* 원래는 전일 기준인데 당일 기준으로 바꿈 (2013.05.15 김대리) */
+        daily_int = g_bal_amt * (adj_rate / 100.0) / 365.0;
+        daily_int = ROUND_WON(daily_int);
+
+        /* 거래내역 커서로 당일 거래 확인 */
+        /* 입출금이 있으면 잔액이 변동되므로 시간가중평균 계산해야하는데 */
+        /* 그냥 기말잔액 기준으로 함 (원래부터 이랬음) */
+        g_txn_cnt = 0;
+        g_txn_amt = 0.0;  /* 여기서는 합계용으로 씀 */
+
+        EXEC SQL SELECT COUNT(*), NVL(SUM(CASE WHEN TXN_TYPE IN ('01','02') THEN TXN_AMT ELSE -TXN_AMT END), 0)
+            INTO :g_txn_cnt, :g_txn_amt :g_txn_amt_ind
+            FROM TB_TXN_HIST
+            WHERE ACCT_NO = :g_acct_no
+            AND   TXN_DT = :g_batch_dt;
+
+        if(sqlca.sqlcode != 0 && sqlca.sqlcode != 1403) {
+            sprintf(g_err_msg, "거래내역 조회 오류: sqlcode=%d", sqlca.sqlcode);
+            goto ERR_HANDLE;
+        }
+        if(g_txn_amt_ind == -1) g_txn_amt = 0.0;
+
+        LOG_DBG(g_log_fp, g_debug_mode, "거래: %s cnt=%d amt=%.0f", g_acct_no, g_txn_cnt, g_txn_amt);
+
+        /* =========================================== */
+        /* 이자 상세 계산                               */
+        /* 계좌유형별 분기 — 누가 이렇게 만들었는지...  */
+        /* =========================================== */
+        accum_int = 0.0;
+
+        if(g_acct_type == 1) {
+            /* 보통예금 — 일일 이자 */
+            accum_int = daily_int;
+        } else if(g_acct_type == 2) {
+            /* 적금 — 월복리 계산해야하는데 일단 단리로 */
+            accum_int = daily_int;
+            /* TODO: 복리 계산 구현 필요 — 2009년 TODO인데 아직도 안함 */
+        } else if(g_acct_type == 3) {
+            /* 정기예금 — 만기일시지급 */
+            /* 만기 전이면 이자 계산만 하고 지급 안함 */
+            accum_int = daily_int;
+            /* 실제 지급은 만기일에 별도 배치로 처리 */
+        } else if(g_acct_type == 4) {
+            /* 자유적금 — 회차별 이자 다름 */
+            /* 2018.09.21 박과장 - 신규 계좌유형이랑 겹쳐서 혼란 */
+            if(g_new_acct_type == 41) {
+                /* 자유적금 신형 */
+                accum_int = daily_int * 1.1;  /* 10% 추가 */
+            } else if(g_new_acct_type == 42) {
+                /* 자유적금 특판 */
+                accum_int = daily_int * 1.2;  /* 20% 추가... 이거 맞나? */
+            } else {
+                accum_int = daily_int;
+            }
+        } else if(g_acct_type == 5) {
+            /* 기업 당좌 */
+            accum_int = daily_int * 0.8;  /* 기업 당좌는 이자 적음 */
+        } else if(g_acct_type == 6) {
+            /* 외화예금 — 여기서 처리하면 안되는데 데이터가 들어옴 */
+            LOG_MSG(g_log_fp, "외화예금 SKIP: %s", g_acct_no);
+            goto SKIP_ACCT;
+        } else if(g_acct_type == 7) {
+            /* 2018.09.21 박과장 추가 — 비대면계좌 */
+            /* 비대면계좌는 우대금리 0.2% 추가 */
+            adj_rate = adj_rate + 0.2;
+            accum_int = g_bal_amt * (adj_rate / 100.0) / 365.0;
+            accum_int = ROUND_WON(accum_int);
+        } else if(g_acct_type == 8 || g_acct_type == 9) {
+            /* 8:청약저축, 9:기타 — 이자 없음 */
+            accum_int = 0.0;
+        } else {
+            accum_int = daily_int;
+        }
+
+        /* =========================================== */
+        /* 이자 계산 함수 호출 (이중 계산)              */
+        /* 위에서 인라인으로 계산하고 또 함수 호출...    */
+        /* 결과가 다르면 함수 결과를 씀                  */
+        /* 왜 이렇게 되었는지는 아무도 모름              */
+        /* =========================================== */
+        rc = calc_interest(g_acct_no, g_acct_type, g_bal_amt, adj_rate, g_spc_rate, g_cust_grade, g_open_dt, &calc_result);
+        if(rc == 0) {
+            /* 함수 계산 성공 */
+            if(ABS_VAL(accum_int - calc_result) > 1.0) {
+                /* 1원 이상 차이나면 로그 남기고 함수 결과 사용 */
+                LOG_MSG(g_log_fp, "이자차이: %s inline=%.0f func=%.0f — 함수결과 사용", g_acct_no, accum_int, calc_result);
+                accum_int = calc_result;
+            }
+        } else if(rc == 1) {
+            /* SKIP */
+            goto SKIP_ACCT;
+        } else {
+            /* 에러 — 인라인 결과 사용 */
+            LOG_ERR(g_err_fp, "이자계산 함수 오류: %s rc=%d — 인라인 결과 사용", g_acct_no, rc);
+        }
+
+        g_int_amt = accum_int;
+
+        /* =========================================== */
+        /* 세금 계산                                   */
+        /* 이자의 15.4% (소득세14% + 지방세1.4%)       */
+        /* =========================================== */
+        if(g_int_amt > 0) {
+            g_tax_amt = g_int_amt * 0.154;
+            g_tax_amt = ROUND_WON(g_tax_amt);
+
+            /* 비과세 체크 */
+            if(g_cust_grade == 1 && g_acct_type == 3) {
+                /* VIP 정기예금 비과세... 이건 좀 이상한데 원래 로직이 이러함 */
+                g_tax_amt = 0.0;
+            }
+            /* 2015.11.03 박사원 - 세금우대 체크 */
+            /* 세금우대는 9.5%만 과세 */
+            if(g_product_cd[0] == 'T') {  /* T로 시작하면 세금우대 상품 */
+                g_tax_amt = g_int_amt * 0.095;
+                g_tax_amt = ROUND_WON(g_tax_amt);
+            }
+        } else {
+            g_tax_amt = 0.0;
+        }
+
+        /* =========================================== */
+        /* 수수료 계산                                 */
+        /* =========================================== */
+CALC_FEE_ONLY:
+        /* 이 라벨은 잔액0 계좌가 직접 여기로 점프할때 씀 */
+        if(g_fee_exempt_yn == 1) {
+            g_fee_amt = 0.0;
+            goto SKIP_FEE;
+        }
+
+        rc = calc_fee(g_acct_no, g_acct_type, g_bal_amt, g_txn_cnt, g_cust_grade, g_fee_exempt_yn, &fee_result);
+        if(rc == 0) {
+            g_fee_amt = fee_result;
+        } else {
+            LOG_ERR(g_err_fp, "수수료 계산 오류: %s rc=%d", g_acct_no, rc);
+            g_fee_amt = 0.0;  /* 에러시 수수료 0으로 */
+        }
+
+        /* 2020.02.10 최주임 - 코로나 수수료 감면 */
+        if(covid_flag && g_covid_rate > 0 && g_fee_amt > 0) {
+            tmp_amt = g_fee_amt * (g_covid_rate / 100.0);
+            g_fee_amt = g_fee_amt - tmp_amt;
+            if(g_fee_amt < 0) g_fee_amt = 0;
+            g_fee_amt = ROUND_WON(g_fee_amt);
+            LOG_DBG(g_log_fp, g_debug_mode, "코로나 수수료 감면: %s 감면액=%.0f", g_acct_no, tmp_amt);
+        }
+
+SKIP_FEE:
+
+        /* =========================================== */
+        /* 정산금액 합산                                */
+        /* =========================================== */
+        g_settle_amt = g_int_amt - g_tax_amt - g_fee_amt;
+        if(g_settle_amt < 0) {
+            /* 수수료가 이자보다 큰 경우 */
+            g_settle_amt = 0 - g_fee_amt;   /* 수수료만 차감 */
+            g_int_amt = 0.0;
+            g_tax_amt = 0.0;
+        }
+
+        LOG_DBG(g_log_fp, g_debug_mode, "정산: %s int=%.0f tax=%.0f fee=%.0f settle=%.0f", g_acct_no, g_int_amt, g_tax_amt, g_fee_amt, g_settle_amt);
+
+        /* =========================================== */
+        /* 정산 처리 — DB 반영                          */
+        /* =========================================== */
+
+        /* 이자 정산 */
+        if(g_int_amt != 0) {
+            rc = proc_settlement(g_acct_no, g_int_amt, "01", g_batch_dt);
+            if(rc != 0) {
+                sprintf(g_err_msg, "이자정산 실패: rc=%d", rc);
+                goto ERR_HANDLE;
+            }
+        }
+
+        /* 수수료 정산 */
+        if(g_fee_amt != 0) {
+            rc = proc_settlement(g_acct_no, g_fee_amt * -1, "02", g_batch_dt);
+            if(rc != 0) {
+                sprintf(g_err_msg, "수수료정산 실패: rc=%d", rc);
+                goto ERR_HANDLE;
+            }
+        }
+
+        /* 세금 정산 */
+        if(g_tax_amt != 0) {
+            rc = proc_settlement(g_acct_no, g_tax_amt * -1, "03", g_batch_dt);
+            if(rc != 0) {
+                sprintf(g_err_msg, "세금정산 실패: rc=%d", rc);
+                goto ERR_HANDLE;
+            }
+        }
+
+        /* 계좌 잔액 UPDATE */
+        g_bal_amt = g_bal_amt + g_settle_amt;
+        EXEC SQL UPDATE TB_ACCT_MST
+            SET BAL_AMT = :g_bal_amt,
+                LAST_TXN_DT = :g_batch_dt,
+                UPD_DT = SYSDATE
+            WHERE ACCT_NO = :g_acct_no;
+
+        if(sqlca.sqlcode != 0) {
+            sprintf(g_err_msg, "잔액 UPDATE 실패: sqlcode=%d", sqlca.sqlcode);
+            goto ERR_HANDLE;
+        }
+
+        /* 정산 일지 INSERT */
+        EXEC SQL INSERT INTO TB_SETTLE_DAILY
+            (ACCT_NO, SETTLE_DT, INT_AMT, FEE_AMT, TAX_AMT, SETTLE_AMT,
+             BAL_AMT, ACCT_TYPE, BR_CD, CUST_GRADE, REG_DT)
+        VALUES
+            (:g_acct_no, :g_batch_dt, :g_int_amt, :g_fee_amt, :g_tax_amt,
+             :g_settle_amt, :g_bal_amt, :g_acct_type, :g_br_cd, :g_cust_grade,
+             SYSDATE);
+
+        if(sqlca.sqlcode != 0) {
+            /* 중복키면 UPDATE */
+            if(sqlca.sqlcode == -1) {
+                EXEC SQL UPDATE TB_SETTLE_DAILY
+                    SET INT_AMT = :g_int_amt,
+                        FEE_AMT = :g_fee_amt,
+                        TAX_AMT = :g_tax_amt,
+                        SETTLE_AMT = :g_settle_amt,
+                        BAL_AMT = :g_bal_amt,
+                        UPD_DT = SYSDATE
+                    WHERE ACCT_NO = :g_acct_no
+                    AND   SETTLE_DT = :g_batch_dt;
+
+                if(sqlca.sqlcode != 0) {
+                    sprintf(g_err_msg, "정산일지 UPDATE 실패: sqlcode=%d", sqlca.sqlcode);
+                    goto ERR_HANDLE;
+                }
+            } else {
+                sprintf(g_err_msg, "정산일지 INSERT 실패: sqlcode=%d", sqlca.sqlcode);
+                goto ERR_HANDLE;
+            }
+        }
+
+        /* 성공 카운트 증가 */
+        g_succ_cnt++;
+        g_total_settle += g_settle_amt;
+        g_total_interest += g_int_amt;
+        g_total_fee += g_fee_amt;
+        g_total_tax += g_tax_amt;
+
+        /* COMMIT 단위 체크 */
+        if(g_succ_cnt % g_commit_unit == 0) {
+            EXEC SQL COMMIT;
+            LOG_MSG(g_log_fp, "COMMIT: %d건 처리완료 (total=%d, err=%d, skip=%d)", g_succ_cnt, g_total_cnt, g_err_cnt, g_skip_cnt);
+        }
+
+        continue;
+
+        /* =========================================== */
+        /* SKIP 처리                                   */
+        /* =========================================== */
+SKIP_ACCT:
+        g_skip_cnt++;
+        LOG_MSG(g_log_fp, "SKIP: [%s] %s — %s", g_acct_no, g_acct_nm, g_err_msg);
+        EXEC SQL ROLLBACK TO SAVEPOINT sp_acct;
+        continue;
+
+        /* =========================================== */
+        /* 에러 처리                                   */
+        /* 2013.05.15 김대리 — 에러시에도 계속 처리     */
+        /* =========================================== */
+ERR_HANDLE:
+        g_err_cnt++;
+        LOG_ERR(g_err_fp, "ERROR: [%s] %s — %s (sqlcode=%d)", g_acct_no, g_acct_nm, g_err_msg, sqlca.sqlcode);
+
+        /* 에러 상세 INSERT */
+        EXEC SQL INSERT INTO TB_BATCH_ERR_LOG
+            (BATCH_ID, BATCH_DT, ACCT_NO, ERR_MSG, ERR_CD, REG_DT)
+        VALUES
+            ('SETTLE_BAT', :g_batch_dt, :g_acct_no, :g_err_msg, :g_acct_stat, SYSDATE);
+        /* 에러 로그 INSERT 실패해도 무시 */
+
+        EXEC SQL ROLLBACK TO SAVEPOINT sp_acct;
+
+        /* 에러가 너무 많으면 배치 중단 */
+        if(g_err_cnt > 1000) {
+            LOG_ERR(g_err_fp, "에러건수 1000건 초과 — 배치 강제 중단");
+            goto BATCH_END;
+        }
+
+        continue;
+    } /* end for(;;) */
+
+    /* =========================================== */
+    /* 메인 루프 종료                               */
+    /* =========================================== */
+BATCH_END:
+    if(strcmp(g_br_cd, "ALL") == 0) {
+        EXEC SQL CLOSE c_acct;
+    } else {
+        EXEC SQL CLOSE c_acct_br;
+    }
+
+    EXEC SQL COMMIT;
+    LOG_MSG(g_log_fp, "최종 COMMIT 완료");
+
+    /* 배치 상태 업데이트 */
+    if(g_err_cnt == 0) {
+        /* 정상 완료 */
+        EXEC SQL UPDATE TB_BATCH_CTL
+            SET BATCH_STAT = 'C',       /* C:완료 */
+                END_DT = SYSDATE,
+                TOTAL_CNT = :g_total_cnt,
+                SUCC_CNT = :g_succ_cnt,
+                ERR_CNT = :g_err_cnt,
+                UPD_DT = SYSDATE
+            WHERE BATCH_ID = 'SETTLE_BAT'
+            AND   BATCH_DT = :g_batch_dt;
+    } else {
+        /* 에러 있음 */
+        EXEC SQL UPDATE TB_BATCH_CTL
+            SET BATCH_STAT = 'E',       /* E:에러 */
+                END_DT = SYSDATE,
+                TOTAL_CNT = :g_total_cnt,
+                SUCC_CNT = :g_succ_cnt,
+                ERR_CNT = :g_err_cnt,
+                UPD_DT = SYSDATE
+            WHERE BATCH_ID = 'SETTLE_BAT'
+            AND   BATCH_DT = :g_batch_dt;
+    }
+    EXEC SQL COMMIT;
+
+    goto CLEANUP;
+
+    /* =========================================== */
+    /* DB 접속 실패 처리                            */
+    /* =========================================== */
+DB_CONN_ERR:
+    LOG_ERR(g_err_fp, "DB 접속 실패: sqlcode=%d %s", sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+    fprintf(stderr, "DB 접속 실패\n");
+    if(g_log_fp != NULL && g_log_fp != stdout) fclose(g_log_fp);
+    if(g_err_fp != NULL && g_err_fp != stderr) fclose(g_err_fp);
+    return ERR_DB_CONNECT;
+
+    /* =========================================== */
+    /* 종료 처리                                   */
+    /* =========================================== */
+CLEANUP:
+    g_end_time = time(NULL);
+    print_summary();
+
+    LOG_MSG(g_log_fp, "========================================");
+    LOG_MSG(g_log_fp, "SETTLE_BAT 종료");
+    LOG_MSG(g_log_fp, "소요시간: %ld초", (long)(g_end_time - g_start_time));
+    LOG_MSG(g_log_fp, "========================================");
+
+    if(g_log_fp != NULL && g_log_fp != stdout) fclose(g_log_fp);
+    if(g_err_fp != NULL && g_err_fp != stderr) fclose(g_err_fp);
+
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+    EXEC SQL COMMIT WORK RELEASE;
+
+    if(g_err_cnt > 0) return ERR_GENERAL;
+    return ERR_SUCCESS;
+}
+
+
+/* ============================================= */
+/* calc_interest — 이자 계산                      */
+/* 2008년 작성, 이후 계속 패치됨                   */
+/* 리턴값: 0=성공, -1=에러, 1=SKIP                */
+/*                                               */
+/* 주의: main에서 인라인으로 계산한 결과랑         */
+/*       여기서 계산한 결과랑 다를 수 있음         */
+/*       그때는 이 함수 결과를 씀 (main 참조)     */
+/* ============================================= */
+int calc_interest(char *acct_no, int acct_type, double bal, double rate, double spc_rate, int cust_grade, char *open_dt, double *result)
+{
+    double  base_int;
+    double  spc_int;
+    double  adj_int;
+    double  final_int;
+    int     hold_days;
+    int     yr1, mn1, dy1, yr2, mn2, dy2;
+    double  tier_rate;
+    char    tmp_dt[9];
+    int     rc;
+    /* 여기서도 DB 조회함 */
+    EXEC SQL BEGIN DECLARE SECTION;
+        char    h_acct_no[21];
+        double  h_promo_rate;
+        short   h_promo_ind;
+        int     h_promo_cnt;
+        char    h_start_dt[9];
+        char    h_end_dt[9];
+        double  h_accum_int;
+        short   h_accum_ind;
+        char    h_batch_dt[9];
+    EXEC SQL END DECLARE SECTION;
+
+    *result = 0.0;
+    strcpy(h_acct_no, acct_no);
+    strcpy(h_batch_dt, g_batch_dt);  /* 전역변수 접근 */
+
+    if(bal <= 0 && acct_type != 5) {
+        /* 잔액 0 이하 — 기업당좌 제외하고 이자 없음 */
+        return 0;
+    }
+
+    /* =========================================== */
+    /* 구간별 이자율 (tiered interest)              */
+    /* 잔액 구간에 따라 이자율이 다름                */
+    /* 이 로직이 가장 복잡함                        */
+    /* =========================================== */
+    tier_rate = rate;
+
+    if(acct_type == 1 || acct_type == 2) {
+        /* 보통예금, 적금 — 구간별 금리 */
+        if(bal < 1000000) {
+            /* 100만 미만 — 기본금리 */
+            tier_rate = rate;
+        } else if(bal < 10000000) {
+            /* 100만~1000만 — +0.1% */
+            tier_rate = rate + 0.1;
+        } else if(bal < 50000000) {
+            /* 1000만~5000만 — +0.2% */
+            tier_rate = rate + 0.2;
+        } else if(bal < 100000000) {
+            /* 5000만~1억 — +0.3% */
+            tier_rate = rate + 0.3;
+        } else if(bal < 500000000) {
+            /* 1억~5억 — +0.4% */
+            tier_rate = rate + 0.4;
+        } else {
+            /* 5억 이상 — +0.5% (VIP 전용 사실상) */
+            tier_rate = rate + 0.5;
+        }
+    } else if(acct_type == 3) {
+        /* 정기예금 — 예치기간별 금리 */
+        /* 개설일로부터 경과일수 계산 */
+        yr1 = (open_dt[0]-'0')*1000 + (open_dt[1]-'0')*100 + (open_dt[2]-'0')*10 + (open_dt[3]-'0');
+        mn1 = (open_dt[4]-'0')*10 + (open_dt[5]-'0');
+        dy1 = (open_dt[6]-'0')*10 + (open_dt[7]-'0');
+        yr2 = (g_batch_dt[0]-'0')*1000 + (g_batch_dt[1]-'0')*100 + (g_batch_dt[2]-'0')*10 + (g_batch_dt[3]-'0');
+        mn2 = (g_batch_dt[4]-'0')*10 + (g_batch_dt[5]-'0');
+        dy2 = (g_batch_dt[6]-'0')*10 + (g_batch_dt[7]-'0');
+
+        hold_days = (yr2 - yr1) * 365 + (mn2 - mn1) * 30 + (dy2 - dy1);
+        if(hold_days < 0) hold_days = 0;
+
+        if(hold_days < 90) {
+            tier_rate = rate * 0.5;     /* 3개월 미만 — 반만 */
+        } else if(hold_days < 180) {
+            tier_rate = rate * 0.7;     /* 6개월 미만 */
+        } else if(hold_days < 365) {
+            tier_rate = rate * 0.9;     /* 1년 미만 */
+        } else {
+            tier_rate = rate;           /* 1년 이상 — 정상금리 */
+        }
+    } else if(acct_type == 4) {
+        tier_rate = rate;
+    } else if(acct_type == 5) {
+        /* 기업 당좌 — 마이너스 통장이면 대출이자 적용 */
+        if(bal < 0) {
+            tier_rate = rate + 3.0;  /* 대출금리 가산 3% */
+        } else {
+            tier_rate = rate * 0.5;  /* 예금 시 금리 반으로 */
+        }
+    } else if(acct_type == 7) {
+        /* 비대면계좌 — 무조건 0.2% 추가 (main에서도 함) */
+        tier_rate = rate + 0.2;
+    } else {
+        tier_rate = rate;
+    }
+
+    /* 프로모션 금리 체크 — DB 조회 */
+    h_promo_rate = 0.0;
+    h_promo_ind = 0;
+
+    EXEC SQL SELECT NVL(PROMO_RATE, 0), START_DT, END_DT
+        INTO :h_promo_rate :h_promo_ind, :h_start_dt, :h_end_dt
+        FROM TB_PROMO_RATE
+        WHERE ACCT_NO = :h_acct_no
+        AND   :h_batch_dt BETWEEN START_DT AND END_DT
+        AND   USE_YN = 'Y'
+        AND   ROWNUM = 1;
+
+    if(sqlca.sqlcode == 0 && h_promo_ind != -1 && h_promo_rate > 0) {
+        tier_rate = tier_rate + h_promo_rate;
+        LOG_DBG(g_log_fp, g_debug_mode, "프로모션 금리 적용: %s +%.4f%%", acct_no, h_promo_rate);
+    }
+    /* sqlcode 1403이면 프로모션 없는거니까 무시 */
+
+    /* 기본 이자 계산 */
+    base_int = bal * (tier_rate / 100.0) / 365.0;
+    base_int = ROUND_WON(base_int);
+
+    /* 우대금리 이자 추가 */
+    spc_int = 0.0;
+    if(spc_rate > 0 && cust_grade <= 3) {
+        spc_int = bal * (spc_rate / 100.0) / 365.0;
+        spc_int = ROUND_WON(spc_int);
+    }
+
+    /* 최종 이자 */
+    final_int = base_int + spc_int;
+
+    /* 이자 상한 체크 — 일일 이자가 1000만원 넘으면 확인 필요 */
+    if(final_int > 10000000) {
+        LOG_MSG(g_log_fp, "고액이자 주의: %s 일이자=%.0f 잔액=%.0f 금리=%.4f", acct_no, final_int, bal, tier_rate);
+    }
+
+    /* 기존 누적이자 조회 — 이거 왜 여기서 하는지 모르겠음 */
+    EXEC SQL SELECT NVL(SUM(INT_AMT), 0)
+        INTO :h_accum_int :h_accum_ind
+        FROM TB_SETTLE_DAILY
+        WHERE ACCT_NO = :h_acct_no
+        AND   SETTLE_DT BETWEEN SUBSTR(:h_batch_dt, 1, 6) || '01' AND :h_batch_dt;
+
+    if(sqlca.sqlcode != 0 && sqlca.sqlcode != 1403) {
+        LOG_ERR(g_err_fp, "누적이자 조회 오류: %s sqlcode=%d", acct_no, sqlca.sqlcode);
+        /* 에러여도 계속 */
+    }
+    if(h_accum_ind == -1) h_accum_int = 0.0;
+
+    /* 월간 누적 로그 (디버그용) */
+    LOG_DBG(g_log_fp, g_debug_mode, "이자계산: %s base=%.0f spc=%.0f total=%.0f 월누적=%.0f", acct_no, base_int, spc_int, final_int, h_accum_int);
+
+    *result = final_int;
+    return 0;
+}
+
+
+/* ============================================= */
+/* calc_fee — 수수료 계산                         */
+/* 2013.05.15 김대리 추가                         */
+/* 수수료 정책이 자주 바뀌어서 여기가 가장 많이    */
+/* 수정되는 곳임. 수정시 주의할 것                 */
+/* ============================================= */
+int calc_fee(char *acct_no, int acct_type, double bal, int txn_cnt, int cust_grade, int fee_exempt, double *fee_amt)
+{
+    double  base_fee;
+    double  txn_fee;
+    double  maint_fee;
+    double  total_fee;
+    int     free_txn_cnt;
+    int     chargeable_cnt;
+
+    EXEC SQL BEGIN DECLARE SECTION;
+        char    h_acct_no2[21];
+        double  h_fee_rate;
+        short   h_fee_rate_ind;
+        int     h_free_cnt;
+        short   h_free_cnt_ind;
+        double  h_maint_fee;
+        short   h_maint_ind;
+        char    h_batch_dt2[9];
+    EXEC SQL END DECLARE SECTION;
+
+    *fee_amt = 0.0;
+    base_fee = 0.0;
+    txn_fee = 0.0;
+    maint_fee = 0.0;
+
+    if(fee_exempt == 1) {
+        return 0;
+    }
+
+    strcpy(h_acct_no2, acct_no);
+    strcpy(h_batch_dt2, g_batch_dt);
+
+    /* 수수료율 조회 — 상품별 수수료 */
+    EXEC SQL SELECT NVL(FEE_RATE, 0), NVL(FREE_TXN_CNT, 0), NVL(MAINT_FEE, 0)
+        INTO :h_fee_rate :h_fee_rate_ind, :h_free_cnt :h_free_cnt_ind,
+             :h_maint_fee :h_maint_ind
+        FROM TB_FEE_MST A, TB_ACCT_MST B
+        WHERE A.PRODUCT_CD = B.PRODUCT_CD
+        AND   B.ACCT_NO = :h_acct_no2
+        AND   A.USE_YN = 'Y'
+        AND   :h_batch_dt2 BETWEEN A.START_DT AND NVL(A.END_DT, '99991231');
+
+    if(sqlca.sqlcode == 1403) {
+        /* 수수료 정보 없음 — 기본값 적용 */
+        h_fee_rate = 0.01;   /* 0.01% */
+        h_free_cnt = 10;
+        h_maint_fee = 1000;  /* 1000원 */
+        LOG_DBG(g_log_fp, g_debug_mode, "수수료 정보 없음: %s — 기본값 적용", acct_no);
+    } else if(sqlca.sqlcode != 0) {
+        LOG_ERR(g_err_fp, "수수료 조회 오류: %s sqlcode=%d", acct_no, sqlca.sqlcode);
+        return ERR_FEE_CALC;
+    }
+
+    if(h_fee_rate_ind == -1) h_fee_rate = 0.0;
+    if(h_free_cnt_ind == -1) h_free_cnt = 0;
+    if(h_maint_ind == -1) h_maint_fee = 0.0;
+
+    /* =========================================== */
+    /* 거래 건수별 수수료                            */
+    /* 무료 건수 초과분에 대해 건당 수수료 부과      */
+    /* =========================================== */
+    free_txn_cnt = h_free_cnt;
+
+    /* 고객등급별 무료 건수 추가 */
+    if(cust_grade == 1) {
+        free_txn_cnt = 99999;   /* VIP 무제한 */
+    } else if(cust_grade == 2) {
+        free_txn_cnt += 20;     /* 골드 +20건 */
+    } else if(cust_grade == 3) {
+        free_txn_cnt += 10;     /* 실버 +10건 */
+    } else if(cust_grade == 4) {
+        free_txn_cnt += 5;      /* 브론즈 +5건 */
+    }
+    /* 등급 5는 추가 없음 */
+
+    chargeable_cnt = txn_cnt - free_txn_cnt;
+    if(chargeable_cnt < 0) chargeable_cnt = 0;
+
+    /* 건당 수수료 — 계좌유형별 다름 (또...) */
+    if(acct_type == 1) {
+        txn_fee = chargeable_cnt * 500;          /* 건당 500원 */
+    } else if(acct_type == 2) {
+        txn_fee = chargeable_cnt * 300;          /* 적금 건당 300원 */
+    } else if(acct_type == 3) {
+        txn_fee = 0;                              /* 정기예금 거래수수료 없음 */
+    } else if(acct_type == 4) {
+        txn_fee = chargeable_cnt * 400;
+    } else if(acct_type == 5) {
+        txn_fee = chargeable_cnt * 200;          /* 기업 할인 */
+    } else if(acct_type == 7) {
+        txn_fee = chargeable_cnt * 100;          /* 비대면 할인 */
+    } else {
+        txn_fee = chargeable_cnt * 500;          /* 기본 */
+    }
+
+    /* 잔액 기반 수수료 */
+    if(h_fee_rate > 0 && bal > 0) {
+        base_fee = bal * (h_fee_rate / 100.0) / 365.0;
+        base_fee = ROUND_WON(base_fee);
+    }
+
+    /* 계좌 유지 수수료 — 월1회만 부과 */
+    /* 매월 1일에만 부과 */
+    maint_fee = 0.0;
+    if(g_batch_dt[6] == '0' && g_batch_dt[7] == '1') {
+        maint_fee = h_maint_fee;
+        /* 잔액 기준 면제 */
+        if(bal >= 1000000) {
+            maint_fee = 0.0;  /* 100만원 이상 면제 */
+        }
+    }
+
+    /* 수수료 상한 — 월 최대 50000원 */
+    total_fee = base_fee + txn_fee + maint_fee;
+    if(total_fee > 50000) {
+        total_fee = 50000;
+    }
+
+    /* 수수료 하한 — 최소 0원 (마이너스 안됨) */
+    if(total_fee < 0) total_fee = 0;
+
+    /* 2020.02.10 최주임 — 코로나 기간 수수료 면제 (여기서도 체크?) */
+    /* 이미 main에서 감면하는데 여기서 또? 일단 주석 */
+    /*
+    if(strcmp(g_batch_dt, "20200301") >= 0 && strcmp(g_batch_dt, "20210630") <= 0) {
+        total_fee = 0;
+    }
+    */
+
+    *fee_amt = total_fee;
+    return 0;
+}
+
+
+/* ============================================= */
+/* proc_settlement — 정산 처리 (DB 반영)          */
+/* 이 함수도 DB 직접 접근함                       */
+/* ============================================= */
+int proc_settlement(char *acct_no, double settle_amt, char *settle_type, char *batch_dt)
+{
+    int rc = 0;
+    int retry;
+
+    EXEC SQL BEGIN DECLARE SECTION;
+        char    h_acct_no3[21];
+        char    h_settle_type[3];
+        char    h_batch_dt3[9];
+        double  h_settle_amt;
+        int     h_seq;
+        double  h_cur_bal;
+        short   h_cur_bal_ind;
+    EXEC SQL END DECLARE SECTION;
+
+    strcpy(h_acct_no3, acct_no);
+    strcpy(h_settle_type, settle_type);
+    strcpy(h_batch_dt3, batch_dt);
+    h_settle_amt = settle_amt;
+
+    /* 순번 채번 */
+    EXEC SQL SELECT NVL(MAX(SETTLE_SEQ), 0) + 1
+        INTO :h_seq
+        FROM TB_SETTLE_HIST
+        WHERE ACCT_NO = :h_acct_no3
+        AND   SETTLE_DT = :h_batch_dt3;
+
+    if(sqlca.sqlcode != 0 && sqlca.sqlcode != 1403) {
+        LOG_ERR(g_err_fp, "순번 채번 실패: %s sqlcode=%d", acct_no, sqlca.sqlcode);
+        return ERR_SETTLE_AMT;
+    }
+    if(sqlca.sqlcode == 1403) h_seq = 1;
+
+    /* 잔액 조회 (FOR UPDATE) — 동시 처리 방지 */
+    retry = 0;
+RETRY_LOCK:
+    EXEC SQL SELECT BAL_AMT
+        INTO :h_cur_bal :h_cur_bal_ind
+        FROM TB_ACCT_MST
+        WHERE ACCT_NO = :h_acct_no3
+        FOR UPDATE NOWAIT;
+
+    if(sqlca.sqlcode == -54) {
+        /* ORA-00054: 리소스 사용중 — 재시도 */
+        retry++;
+        if(retry <= MAX_RETRY) {
+            LOG_MSG(g_log_fp, "LOCK 대기: %s retry=%d", acct_no, retry);
+            sleep(1);
+            goto RETRY_LOCK;
+        } else {
+            LOG_ERR(g_err_fp, "LOCK 획득 실패: %s — 최대 재시도 초과", acct_no);
+            return ERR_SETTLE_LOCK;
+        }
+    } else if(sqlca.sqlcode != 0) {
+        LOG_ERR(g_err_fp, "잔액 조회 실패: %s sqlcode=%d", acct_no, sqlca.sqlcode);
+        return ERR_SETTLE_AMT;
+    }
+    if(h_cur_bal_ind == -1) h_cur_bal = 0.0;
+
+    /* 정산내역 INSERT */
+    EXEC SQL INSERT INTO TB_SETTLE_HIST
+        (ACCT_NO, SETTLE_DT, SETTLE_SEQ, SETTLE_TYPE, SETTLE_AMT,
+         BF_BAL, AF_BAL, REG_DT)
+    VALUES
+        (:h_acct_no3, :h_batch_dt3, :h_seq, :h_settle_type, :h_settle_amt,
+         :h_cur_bal, :h_cur_bal + :h_settle_amt, SYSDATE);
+
+    if(sqlca.sqlcode != 0) {
+        LOG_ERR(g_err_fp, "정산내역 INSERT 실패: %s seq=%d sqlcode=%d", acct_no, h_seq, sqlca.sqlcode);
+        return ERR_SETTLE_AMT;
+    }
+
+    /* 잔액 반영은 호출하는 쪽(main)에서 함 — 여기서 또 하면 이중 반영 */
+    /* 근데 과거에는 여기서 했었음. 아래 주석이 그 흔적 */
+    /*
+    EXEC SQL UPDATE TB_ACCT_MST
+        SET BAL_AMT = BAL_AMT + :h_settle_amt,
+            UPD_DT = SYSDATE
+        WHERE ACCT_NO = :h_acct_no3;
+    */
+    /* 2013.05.15 김대리 - 이중반영 버그 수정하면서 주석처리 */
+    /* 절대 이 주석 풀지 말것!!! */
+
+    return 0;
+}
+
+
+/* ============================================= */
+/* print_summary — 처리 결과 요약 출력             */
+/* ============================================= */
+void print_summary(void)
+{
+    LOG_MSG(g_log_fp, "");
+    LOG_MSG(g_log_fp, "========================================");
+    LOG_MSG(g_log_fp, "          정산 배치 처리 결과            ");
+    LOG_MSG(g_log_fp, "========================================");
+    LOG_MSG(g_log_fp, "배치일자     : %s", g_batch_dt);
+    LOG_MSG(g_log_fp, "영업점       : %s", g_br_cd);
+    LOG_MSG(g_log_fp, "작업유형     : %s", g_job_type);
+    LOG_MSG(g_log_fp, "----------------------------------------");
+    LOG_MSG(g_log_fp, "총 처리건수  : %d", g_total_cnt);
+    LOG_MSG(g_log_fp, "성공건수     : %d", g_succ_cnt);
+    LOG_MSG(g_log_fp, "오류건수     : %d", g_err_cnt);
+    LOG_MSG(g_log_fp, "SKIP건수     : %d", g_skip_cnt);
+    LOG_MSG(g_log_fp, "----------------------------------------");
+    LOG_MSG(g_log_fp, "총 정산금액  : %,.0f", g_total_settle);
+    LOG_MSG(g_log_fp, "총 이자금액  : %,.0f", g_total_interest);
+    LOG_MSG(g_log_fp, "총 수수료    : %,.0f", g_total_fee);
+    LOG_MSG(g_log_fp, "총 세금      : %,.0f", g_total_tax);
+    if(g_limit_over_cnt > 0) {
+        LOG_MSG(g_log_fp, "한도초과건수 : %d", g_limit_over_cnt);
+        LOG_MSG(g_log_fp, "한도초과금액 : %,.0f", g_limit_over_total);
+    }
+    LOG_MSG(g_log_fp, "커밋단위     : %d", g_commit_unit);
+    LOG_MSG(g_log_fp, "소요시간     : %ld초", (long)(time(NULL) - g_start_time));
+    LOG_MSG(g_log_fp, "========================================");
+
+    /* stdout에도 출력 */
+    printf("\n");
+    printf("SETTLE_BAT 처리결과\n");
+    printf("배치일자: %s\n", g_batch_dt);
+    printf("총건수: %d  성공: %d  오류: %d  SKIP: %d\n", g_total_cnt, g_succ_cnt, g_err_cnt, g_skip_cnt);
+    printf("정산금액: %.0f  이자: %.0f  수수료: %.0f  세금: %.0f\n", g_total_settle, g_total_interest, g_total_fee, g_total_tax);
+    printf("\n");
+}
+
+
+/*
+ * 아래는 더이상 사용하지 않는 함수들
+ * 삭제하면 좋겠는데 혹시 몰라서 남겨둠
+ */
+
+/*
+int old_calc_interest(char *acct_no, double bal, double rate, double *result)
+{
+    double tmp;
+    tmp = bal * rate / 100.0 / 365.0;
+    *result = (double)((int)(tmp + 0.5));
+    return 0;
+}
+*/
+
+/*
+ * 2009년에 만들었다가 폐기한 배치 재처리 함수
+ * proc_retry 라고 이름 지었는데 안씀
+ *
+int proc_retry(char *batch_dt, char *acct_no)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        char h_bd[9];
+        char h_an[21];
+        int  h_cnt;
+    EXEC SQL END DECLARE SECTION;
+
+    strcpy(h_bd, batch_dt);
+    strcpy(h_an, acct_no);
+
+    EXEC SQL SELECT COUNT(*) INTO :h_cnt
+        FROM TB_BATCH_ERR_LOG
+        WHERE BATCH_DT = :h_bd
+        AND   ACCT_NO = :h_an;
+
+    if(h_cnt > 3) {
+        return -1;
+    }
+
+    EXEC SQL DELETE FROM TB_SETTLE_DAILY
+        WHERE ACCT_NO = :h_an
+        AND   SETTLE_DT = :h_bd;
+
+    EXEC SQL DELETE FROM TB_SETTLE_HIST
+        WHERE ACCT_NO = :h_an
+        AND   SETTLE_DT = :h_bd;
+
+    return 0;
+}
+*/
+
+/*
+ * 2011년에 만들었다가 안쓰는 CSV 출력 함수
+ *
+void write_csv_line(FILE *fp, char *acct_no, double int_amt, double fee_amt, double settle_amt)
+{
+    fprintf(fp, "%s,%f,%f,%f\n", acct_no, int_amt, fee_amt, settle_amt);
+}
+*/
+
+/* ============================================= */
+/* END OF SETTLE_BAT.pc                          */
+/* 이 파일 길다... 리팩토링 좀 하자 — 2023.01    */
+/* ============================================= */

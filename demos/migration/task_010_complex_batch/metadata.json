@@ -1,0 +1,343 @@
+{
+  "task_id": "task_010_complex_batch",
+  "title": "Daily Settlement Batch (SETTLE_BAT + RPT_DAILY)",
+  "description": "Legacy Pro*C daily settlement batch system. Calculates interest, fees, and taxes for all accounts, updates balances, and generates daily reports. Written over 15 years by multiple developers with no refactoring.",
+  "language": "Pro*C (C with Embedded SQL)",
+  "database": "Oracle 12c+",
+  "difficulty": "hard",
+  "estimated_lines": 2200,
+  "source_files": [
+    {
+      "path": "src/SETTLE_BAT.pc",
+      "type": "proc",
+      "lines": 1250,
+      "description": "Main settlement batch program. Processes all accounts: interest calculation, fee calculation, tax calculation, settlement posting, balance update.",
+      "functions": [
+        {
+          "name": "main",
+          "lines": "120-530",
+          "description": "Main entry point. 400+ lines of inline logic including arg parsing, DB connect, cursor loop, inline calculations, GOTO error handling, commit management."
+        },
+        {
+          "name": "calc_interest",
+          "lines": "545-735",
+          "description": "Interest calculation with tiered rates, promotion rates, account-type-specific logic, period-based rates for fixed deposits."
+        },
+        {
+          "name": "calc_fee",
+          "lines": "745-895",
+          "description": "Fee calculation with transaction-based fees, balance-based fees, maintenance fees, grade-based exemptions."
+        },
+        {
+          "name": "proc_settlement",
+          "lines": "905-990",
+          "description": "Settlement posting with sequence generation, row locking (SELECT FOR UPDATE), retry logic, settlement history INSERT."
+        },
+        {
+          "name": "print_summary",
+          "lines": "997-1030",
+          "description": "Prints batch processing summary to log and stdout."
+        },
+        {
+          "name": "sig_handler",
+          "lines": "105-118",
+          "description": "Signal handler for SIGINT/SIGTERM. Rollback and cleanup on abnormal termination."
+        }
+      ]
+    },
+    {
+      "path": "src/RPT_DAILY.pc",
+      "type": "proc",
+      "lines": 550,
+      "description": "Daily report generator. Produces fixed-width text reports: branch summary, customer grade stats, account type stats, limit-over report.",
+      "functions": [
+        {
+          "name": "main",
+          "lines": "85-205",
+          "description": "Entry point. DB connect, batch result check, calls report generators."
+        },
+        {
+          "name": "gen_branch_report",
+          "lines": "215-320",
+          "description": "Branch-level settlement report using Oracle CONNECT BY for tree hierarchy."
+        },
+        {
+          "name": "gen_grade_report",
+          "lines": "328-385",
+          "description": "Customer grade statistics using Oracle DECODE for pivot."
+        },
+        {
+          "name": "gen_type_report",
+          "lines": "392-465",
+          "description": "Account type statistics with GROUP BY aggregation."
+        },
+        {
+          "name": "gen_limit_report",
+          "lines": "473-530",
+          "description": "Limit-over accounts report with top-100 cutoff."
+        },
+        {
+          "name": "print_rpt_header",
+          "lines": "535-550",
+          "description": "Report section header with timestamp."
+        },
+        {
+          "name": "print_rpt_footer",
+          "lines": "555-565",
+          "description": "Report footer with contact info."
+        }
+      ]
+    },
+    {
+      "path": "src/common_def.h",
+      "type": "header",
+      "lines": 230,
+      "description": "Shared header with error codes, macros, struct definitions, logging macros. Included by both .pc files."
+    }
+  ],
+  "sql_files": [
+    {
+      "path": "sql/schema.sql",
+      "type": "ddl",
+      "description": "Oracle DDL for all 14 tables, indexes, sequences, comments, and reference data."
+    }
+  ],
+  "tables": [
+    {
+      "name": "TB_ACCT_MST",
+      "description": "Account master",
+      "pk": "ACCT_NO",
+      "usage": ["SETTLE_BAT:cursor_read", "SETTLE_BAT:update_balance", "RPT_DAILY:limit_report"]
+    },
+    {
+      "name": "TB_CUST_MST",
+      "description": "Customer master",
+      "pk": "CUST_NO",
+      "usage": ["SETTLE_BAT:cursor_join"]
+    },
+    {
+      "name": "TB_PRODUCT_MST",
+      "description": "Product master",
+      "pk": "PRODUCT_CD",
+      "usage": ["SETTLE_BAT:cursor_join"]
+    },
+    {
+      "name": "TB_BRANCH_MST",
+      "description": "Branch master (hierarchical)",
+      "pk": "BR_CD",
+      "usage": ["RPT_DAILY:branch_report"]
+    },
+    {
+      "name": "TB_TXN_HIST",
+      "description": "Transaction history",
+      "pk": "ACCT_NO, TXN_DT, TXN_SEQ",
+      "usage": ["SETTLE_BAT:txn_count_query"]
+    },
+    {
+      "name": "TB_FEE_MST",
+      "description": "Fee master",
+      "pk": "PRODUCT_CD, FEE_SEQ",
+      "usage": ["SETTLE_BAT:calc_fee"]
+    },
+    {
+      "name": "TB_PROMO_RATE",
+      "description": "Promotion interest rates",
+      "pk": "ACCT_NO, PROMO_SEQ",
+      "usage": ["SETTLE_BAT:calc_interest"]
+    },
+    {
+      "name": "TB_ACCT_LIMIT",
+      "description": "Account balance limits",
+      "pk": "ACCT_NO",
+      "usage": ["SETTLE_BAT:cursor_join", "SETTLE_BAT:limit_check", "RPT_DAILY:limit_report"]
+    },
+    {
+      "name": "TB_COVID_EXEMPT",
+      "description": "COVID-19 fee exemption settings",
+      "pk": "EXEMPT_SEQ",
+      "usage": ["SETTLE_BAT:covid_check"]
+    },
+    {
+      "name": "TB_SETTLE_HIST",
+      "description": "Settlement history (per-transaction)",
+      "pk": "ACCT_NO, SETTLE_DT, SETTLE_SEQ",
+      "usage": ["SETTLE_BAT:proc_settlement"]
+    },
+    {
+      "name": "TB_SETTLE_DAILY",
+      "description": "Daily settlement summary (per-account per-day)",
+      "pk": "ACCT_NO, SETTLE_DT",
+      "usage": ["SETTLE_BAT:insert_daily", "SETTLE_BAT:calc_interest_accum", "RPT_DAILY:all_reports"]
+    },
+    {
+      "name": "TB_BATCH_CTL",
+      "description": "Batch control (status tracking)",
+      "pk": "BATCH_ID, BATCH_DT",
+      "usage": ["SETTLE_BAT:status_check", "SETTLE_BAT:status_update", "RPT_DAILY:result_check"]
+    },
+    {
+      "name": "TB_BATCH_ERR_LOG",
+      "description": "Batch error log",
+      "pk": null,
+      "usage": ["SETTLE_BAT:error_logging"]
+    },
+    {
+      "name": "TB_LIMIT_OVER_LOG",
+      "description": "Limit-over audit log",
+      "pk": "ACCT_NO, CHECK_DT",
+      "usage": ["SETTLE_BAT:limit_over_insert"]
+    }
+  ],
+  "constructs": {
+    "embedded_sql": {
+      "static_cursors": [
+        "c_acct (SETTLE_BAT: main account cursor, ALL branches — 4-table join with outer joins)",
+        "c_acct_br (SETTLE_BAT: main account cursor, specific branch — duplicate of c_acct with branch filter)",
+        "c_br_rpt (RPT_DAILY: branch report with CONNECT BY PRIOR tree traversal)",
+        "c_type_rpt (RPT_DAILY: account type GROUP BY report)",
+        "c_limit_rpt (RPT_DAILY: limit-over accounts DESC by over amount)"
+      ],
+      "select_into": [
+        "TB_BATCH_CTL status check (reuses g_txn_cnt variable)",
+        "TB_COVID_EXEMPT rate lookup with ROWNUM=1",
+        "TB_TXN_HIST COUNT/SUM aggregate with CASE WHEN",
+        "TB_PROMO_RATE promotion rate lookup with date range and ROWNUM=1",
+        "TB_FEE_MST fee rate lookup with 2-table join and date range",
+        "TB_SETTLE_DAILY accumulated monthly interest SUM",
+        "TB_ACCT_MST balance SELECT FOR UPDATE NOWAIT (in proc_settlement)",
+        "TB_SETTLE_HIST MAX(SETTLE_SEQ)+1 sequence generation",
+        "TB_BATCH_CTL result check (RPT_DAILY)",
+        "DECODE pivot query for grade stats (RPT_DAILY — 10 columns in single query)"
+      ],
+      "insert": [
+        "TB_LIMIT_OVER_LOG (with DUP_KEY ignore)",
+        "TB_SETTLE_HIST (settlement posting)",
+        "TB_SETTLE_DAILY (with UPSERT: INSERT then UPDATE on DUP_KEY)",
+        "TB_BATCH_ERR_LOG (error logging, failure ignored)"
+      ],
+      "update": [
+        "TB_BATCH_CTL status to P (processing start)",
+        "TB_BATCH_CTL status to C or E (batch end)",
+        "TB_ACCT_MST balance + last_txn_dt update",
+        "TB_SETTLE_DAILY (upsert fallback on duplicate key)"
+      ],
+      "transaction_control": [
+        "SAVEPOINT sp_acct (per-account, in main loop)",
+        "COMMIT every N records (configurable, default 100)",
+        "COMMIT final (after main loop)",
+        "ROLLBACK TO SAVEPOINT sp_acct (on ERR_HANDLE and SKIP_ACCT)",
+        "ROLLBACK WORK (in signal handler)",
+        "SELECT FOR UPDATE NOWAIT with retry loop (in proc_settlement)",
+        "COMMIT WORK RELEASE (disconnect)"
+      ]
+    },
+    "oracle_specific": [
+      "NVL() — null handling throughout all queries",
+      "DECODE() — pivot aggregation in grade report",
+      "SYSDATE — timestamp in all INSERT/UPDATE",
+      "ROWNUM = 1 — top-1 lookup for promo rate and covid exempt",
+      "CONNECT BY PRIOR ... START WITH — branch hierarchy tree",
+      "ORDER SIBLINGS BY — sibling ordering in tree traversal",
+      "outer join (+) syntax — Oracle proprietary outer join in main cursor",
+      "SELECT FOR UPDATE NOWAIT — pessimistic row locking",
+      "ORA-00054 handling — resource busy retry loop",
+      "sqlca.sqlcode == 1403 — no data found (end of cursor / empty result)",
+      "sqlca.sqlcode == -1 — duplicate key (UPSERT pattern)",
+      "TO_CHAR / SUBSTR for date string manipulation in queries"
+    ],
+    "host_variables": {
+      "SETTLE_BAT_declare_section": 42,
+      "RPT_DAILY_declare_section": 30,
+      "calc_interest_local_declare": 8,
+      "calc_fee_local_declare": 7,
+      "proc_settlement_local_declare": 6,
+      "gen_limit_report_local_declare": 5,
+      "indicator_variables": 18
+    },
+    "goto_labels": [
+      "ERR_HANDLE (SETTLE_BAT main: per-account error recovery, rollback savepoint, log, continue)",
+      "SKIP_ACCT (SETTLE_BAT main: skip current account, rollback savepoint, continue)",
+      "BATCH_END (SETTLE_BAT main: exit main loop, close cursor, final commit)",
+      "CLEANUP (SETTLE_BAT main: summary print, file close, DB disconnect)",
+      "DB_CONN_ERR (SETTLE_BAT main: DB connection failure, early exit)",
+      "CALC_FEE_ONLY (SETTLE_BAT main: zero-balance accounts jump to fee calculation)",
+      "SKIP_FEE (SETTLE_BAT main: fee-exempt accounts skip fee block)",
+      "RETRY_LOCK (SETTLE_BAT proc_settlement: retry SELECT FOR UPDATE on ORA-00054)",
+      "RPT_DB_ERR (RPT_DAILY main: DB connection failure)",
+      "RPT_CLEANUP (RPT_DAILY main: final cleanup and disconnect)"
+    ],
+    "global_state": [
+      "g_total_cnt, g_succ_cnt, g_err_cnt, g_skip_cnt (processing counters)",
+      "g_total_settle, g_total_interest, g_total_fee, g_total_tax (financial aggregates)",
+      "g_log_fp, g_err_fp (file handles — may point to stdout/stderr on open failure)",
+      "g_commit_unit, g_debug_mode (runtime config from args)",
+      "g_err_msg[MAX_ERR_MSG] (reused error buffer across all contexts)",
+      "g_job_type[3] (batch job type code)",
+      "g_limit_over_cnt, g_limit_over_total (limit-over tracking)",
+      "g_start_time (batch start timestamp)",
+      "base_rate_tbl[10] (hardcoded interest rate table — duplicates DB data)",
+      "spc_rate_tbl[6] (hardcoded special rate table)"
+    ],
+    "error_handling_patterns": [
+      "GOTO-based recovery (main loop: ERR_HANDLE and SKIP_ACCT labels with ROLLBACK TO SAVEPOINT)",
+      "Return codes 0/-1/1 (calc_interest: 0=success, -1=error, 1=skip)",
+      "Return codes 0/ERR_* (calc_fee: 0 or ERR_FEE_CALC)",
+      "Return codes 0/ERR_* (proc_settlement: 0 or ERR_SETTLE_LOCK/ERR_SETTLE_AMT)",
+      "Silent ignore (some INSERT failures not checked)",
+      "Error count threshold (>1000 errors aborts batch)",
+      "WHENEVER SQLERROR GOTO (DB connect phase only)",
+      "WHENEVER SQLERROR CONTINUE (all other phases)"
+    ],
+    "business_rules": [
+      "Interest: tiered by balance range (6 tiers: <1M, <10M, <50M, <100M, <500M, 500M+)",
+      "Interest: tiered by deposit period (4 tiers: <90d, <180d, <365d, 365d+ for fixed deposits)",
+      "Interest: VIP auto-premium +0.5% (cust_grade==1, no spc_rate override)",
+      "Interest: non-face-to-face account +0.2% (acct_type==7, applied in BOTH main and calc_interest)",
+      "Interest: COVID discount -0.1% for types 1,2 (2020-2023 period)",
+      "Interest: promotion rate from DB additive (TB_PROMO_RATE lookup)",
+      "Interest: daily = balance * (rate/100) / 365, rounded to won (ROUND_WON macro)",
+      "Interest: new_acct_type 41=+10%, 42=+20% multiplier for type 4",
+      "Interest: corporate checking (type 5) negative balance = +3% loan rate",
+      "Interest: duplicate inline+function calc with >1 won difference reconciliation",
+      "Tax: 15.4% of interest (income 14% + local 1.4%)",
+      "Tax: VIP fixed deposit exempt (acct_type==3, cust_grade==1)",
+      "Tax: product_cd starting with 'T' = preferential 9.5% rate",
+      "Fee: transaction-count-based per account type (500/300/0/400/200/100 won per extra txn)",
+      "Fee: balance-based daily (fee_rate% / 365)",
+      "Fee: maintenance monthly (1st of month only, exempt if balance >= 1M won)",
+      "Fee: grade-based free transaction count (VIP=unlimited, Gold+20, Silver+10, Bronze+5)",
+      "Fee: monthly cap 50,000 won",
+      "Fee: COVID exemption rate applied (from TB_COVID_EXEMPT)",
+      "Settlement: net = interest - tax - fee (negative means fee exceeds interest)",
+      "Commit: every N records (configurable via arg, default 100)",
+      "Error threshold: batch aborts after 1000 errors",
+      "Dormant: skip if last_txn_dt > 365 days ago (approximate date math)",
+      "Suspended (stat==2): fee exempt, interest only",
+      "Foreign currency (type 6): always skip",
+      "Zero balance + normal: fee only path (CALC_FEE_ONLY goto)"
+    ]
+  },
+  "known_issues": [
+    "Duplicate interest calculation: inline in main() AND via calc_interest() function, with >1 won reconciliation",
+    "Hardcoded DB credentials as fallback (BATCH_USER / batch1234 in plaintext)",
+    "Magic numbers throughout (account status 1/2/3/9, types 1-9, grade 1-5, tax 15.4%, etc.)",
+    "Date arithmetic is approximate (month=30 days, year=365 days, character arithmetic on date strings)",
+    "g_txn_cnt variable reused for batch control check AND transaction count (different semantic meanings)",
+    "g_txn_amt variable reused for per-transaction amount AND sum aggregate",
+    "COVID exemption applied in main() for fees AND 0.1% interest discount — commented-out duplicate in calc_fee()",
+    "Non-face-to-face +0.2% applied in both main() and calc_interest() (double application)",
+    "proc_settlement has commented-out balance UPDATE that previously caused double-posting",
+    "Race condition: MAX(SEQ)+1 for sequence generation instead of Oracle SEQUENCE",
+    "Inconsistent error handling: GOTO vs return codes vs silent ignore across functions",
+    "Dead code: 3 commented-out functions at end of SETTLE_BAT.pc with historical dates",
+    "Dead code: gen_csv_report stub in RPT_DAILY.pc (2021 attempt abandoned)",
+    "Mixed indentation: tabs in DECLARE SECTION, spaces elsewhere",
+    "Duplicate cursor declarations: c_acct and c_acct_br are nearly identical (only WHERE clause differs)",
+    "g_br_cd overwritten during fetch when mode is ALL (used for both filter and output)"
+  ],
+  "dependencies": {
+    "build": ["Oracle Pro*C precompiler (proc)", "Oracle client libraries (libclntsh, libsql12)", "GCC"],
+    "runtime": ["Oracle 12c+ database", "Environment variables: ORACLE_UID, ORACLE_PWD, ORACLE_SID"],
+    "filesystem": ["/app/batch/log/ (log output)", "/app/batch/report/ (report output)"]
+  }
+}
