@@ -610,6 +610,67 @@ def filter_tools_by_mode(tools: list[dict], system_content: str) -> list[dict]:
 # System prompt compression
 # ---------------------------------------------------------------------------
 
+def inject_diff_failure_guidance(messages: list[dict]) -> list[dict]:
+    """
+    Detect apply_diff failures in tool_results and inject guidance.
+    When Roo Code returns 'No sufficiently similar match' or 'needs 100%',
+    tell the model to read_file first before retrying.
+    """
+    diff_error_patterns = [
+        "sufficiently similar match",
+        "needs 100%",
+        "similarity",
+        "No match found",
+        "search content does not match",
+    ]
+
+    found_diff_error = False
+    target_file = None
+
+    for msg in reversed(messages):
+        content = ""
+        if isinstance(msg.get("content"), str):
+            content = msg["content"]
+        elif isinstance(msg.get("content"), list):
+            content = " ".join(
+                block.get("content", "") or block.get("text", "")
+                for block in msg["content"]
+                if isinstance(block, dict)
+            )
+
+        if any(pattern in content for pattern in diff_error_patterns):
+            found_diff_error = True
+            # Try to extract file path from error message
+            import re as _re
+            path_match = _re.search(r'["\']?([^\s"\']+\.(java|xml|yml|yaml|properties|json|md|pc|h|c))["\']?', content)
+            if path_match:
+                target_file = path_match.group(1)
+            break
+
+    if found_diff_error:
+        guidance = (
+            "[FORGE] Previous apply_diff FAILED because content didn't match exactly. "
+            "You MUST call read_file first to get the EXACT current content, "
+            "then retry apply_diff using the EXACT text from the file. "
+            "Do NOT guess or approximate the file content."
+        )
+        if target_file:
+            guidance += f" Target file: {target_file}"
+
+        logger.info(f"[{_ts()}] 🔧 diff failure detected, injecting read_file guidance")
+
+        # Inject as system message right before the last user message
+        result = list(messages)
+        # Find last user message position
+        for i in range(len(result) - 1, -1, -1):
+            if result[i].get("role") == "user":
+                result.insert(i, {"role": "system", "content": guidance})
+                break
+        return result
+
+    return messages
+
+
 def compress_system_messages(messages: list[dict]) -> list[dict]:
     """
     Compress verbose system messages to save context budget.
@@ -1101,6 +1162,10 @@ async def proxy_chat_completions(request: Request) -> Response:
     # Compress system messages to save context budget
     if "messages" in req_body:
         req_body["messages"] = compress_system_messages(req_body["messages"])
+
+    # Detect diff failures and inject read_file guidance
+    if "messages" in req_body:
+        req_body["messages"] = inject_diff_failure_guidance(req_body["messages"])
 
     # Auto-truncate if context too large
     if "messages" in req_body:
