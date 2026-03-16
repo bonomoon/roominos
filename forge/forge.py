@@ -882,15 +882,17 @@ def inject_task_guidance(messages: list[dict]) -> list[dict]:
         )
 
     # General coding guidance for weak models
-    elif any(kw in last_lower for kw in ["만들어", "생성", "create", "implement", "구현"]) and \
-         any(kw in last_lower for kw in [".java", "spring", "entity", "service", "controller"]):
+    elif any(kw in last_lower for kw in ["만들어", "생성", "create", "implement", "구현", "변환", "migration"]):
         guidance = (
-            "[FORGE] Remember:\n"
-            "- Use jakarta.persistence (NOT javax.persistence) for Spring Boot 3.x\n"
-            "- Use @SequenceGenerator for Oracle ID generation (NOT @GeneratedValue(IDENTITY))\n"
-            "- Use BigDecimal for all monetary/decimal fields (NOT double/float)\n"
-            "- Do NOT use update_todo_list. Just create files directly.\n"
-            "- ONE file per response. Use write_to_file for new files."
+            "[FORGE] CRITICAL RULES:\n"
+            "- Do NOT create or edit todo.md or todo list. Skip it entirely.\n"
+            "- Do NOT use update_todo_list tool.\n"
+            "- Go DIRECTLY to creating .java files using write_to_file.\n"
+            "- Start with the FIRST file (pom.xml or Entity class).\n"
+            "- Use jakarta.persistence for Spring Boot 3.x\n"
+            "- Use @SequenceGenerator for Oracle (NOT IDENTITY)\n"
+            "- Use BigDecimal for money (NOT double)\n"
+            "- ONE file per response."
         )
 
     if guidance:
@@ -1130,7 +1132,17 @@ def repair_response(body: dict, req_tools: list[dict] | None = None) -> tuple[di
             elif isinstance(args_str, dict):
                 parsed_args = args_str
 
-            # 3. Convert broken apply_diff to write_to_file when possible
+            # 3. Block todo.md writes — model wastes turns on todo instead of coding
+            if isinstance(parsed_args, dict):
+                target_path = str(parsed_args.get("path", ""))
+                if "todo" in target_path.lower() and target_path.endswith(".md"):
+                    # Skip this tool call entirely — replace with attempt_completion
+                    fn["name"] = "attempt_completion"
+                    fn["arguments"] = json.dumps({"result": "Skipping todo.md — proceed to create actual code files."})
+                    repaired = True
+                    logger.info(f"[{_ts()}] 🚫 blocked todo.md write → redirected to attempt_completion")
+
+            # 4. Convert broken apply_diff to write_to_file when possible
             if clean_name == "apply_diff" and isinstance(parsed_args, dict):
                 should_convert = False
                 # Case A: model sent write_file-style args (path + content, no diff)
