@@ -622,6 +622,9 @@ def inject_diff_failure_guidance(messages: list[dict]) -> list[dict]:
         "similarity",
         "No match found",
         "search content does not match",
+        "Invalid diff format",
+        "missing required sections",
+        "Unable to apply diff",
     ]
 
     found_diff_error = False
@@ -649,10 +652,12 @@ def inject_diff_failure_guidance(messages: list[dict]) -> list[dict]:
 
     if found_diff_error:
         guidance = (
-            "[FORGE] Previous apply_diff FAILED because content didn't match exactly. "
-            "You MUST call read_file first to get the EXACT current content, "
-            "then retry apply_diff using the EXACT text from the file. "
-            "Do NOT guess or approximate the file content."
+            "[FORGE] Previous apply_diff FAILED. To fix:\n"
+            "1. Call read_file to get the EXACT current content of the file.\n"
+            "2. Use the EXACT text from read_file in your diff.\n"
+            "3. Diff format MUST be:\n"
+            "<<<<<<< SEARCH\n:start_line: N\n-------\n[exact old text]\n=======\n[new text]\n>>>>>>> REPLACE\n"
+            "Do NOT guess content. Do NOT use --- +++ @@ format."
         )
         if target_file:
             guidance += f" Target file: {target_file}"
@@ -814,6 +819,7 @@ _TOOL_PARAM_DEFAULTS: dict[str, dict[str, str]] = {
     "list_code_definition_names": {"path": "."},
     "read_file": {"path": ""},
     "execute_command": {"command": "echo 'no command specified'"},
+    "ask_followup_question": {"follow_up": "How would you like to proceed?"},
 }
 
 
