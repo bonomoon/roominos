@@ -837,6 +837,75 @@ def inject_diff_failure_guidance(messages: list[dict]) -> list[dict]:
     return messages
 
 
+def inject_task_guidance(messages: list[dict]) -> list[dict]:
+    """
+    Detect migration/planning requests and inject domain-specific guidance.
+    This compensates for weak models that produce shallow plans.
+    """
+    # Get last user message
+    last_user = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                last_user = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+            elif isinstance(content, str):
+                last_user = content
+            break
+
+    if not last_user:
+        return messages
+
+    last_lower = last_user.lower()
+
+    guidance = None
+
+    # Migration planning detection
+    if any(kw in last_lower for kw in ["plan", "마이그레이션", "migration", "변환", "convert"]) and \
+       any(kw in last_lower for kw in [".pc", "pro*c", "proc", "settle", "legacy", "c파일"]):
+        guidance = (
+            "[FORGE MIGRATION GUIDE] When creating a migration plan, you MUST include ALL of these:\n"
+            "1. Entity classes for EVERY table (check schema.sql or EXEC SQL for table names)\n"
+            "2. Repository interfaces for each entity\n"
+            "3. Service classes with business logic\n"
+            "4. DTO classes for API responses\n"
+            "5. Exception hierarchy (map WHENEVER SQLERROR → custom exceptions)\n"
+            "6. application.yml + application-test.yml (H2 for tests)\n"
+            "7. Test classes for each service\n\n"
+            "BATCH RULES:\n"
+            "- MAX 1-2 files per batch. NEVER 3+.\n"
+            "- Batch order: pom.xml → Entities → Repositories → Services → Controllers → DTOs → Config → Tests\n"
+            "- Each Entity MUST use @SequenceGenerator (Oracle), BigDecimal for money, jakarta.persistence\n"
+            "- Map EVERY EXEC SQL to a specific JPA method or @Query\n"
+            "- Map EVERY GOTO/WHENEVER to a specific exception type\n"
+            "- Map EVERY host variable to a Java field with correct type (double→BigDecimal, char[]→String)"
+        )
+
+    # General coding guidance for weak models
+    elif any(kw in last_lower for kw in ["만들어", "생성", "create", "implement", "구현"]) and \
+         any(kw in last_lower for kw in [".java", "spring", "entity", "service", "controller"]):
+        guidance = (
+            "[FORGE] Remember:\n"
+            "- Use jakarta.persistence (NOT javax.persistence) for Spring Boot 3.x\n"
+            "- Use @SequenceGenerator for Oracle ID generation (NOT @GeneratedValue(IDENTITY))\n"
+            "- Use BigDecimal for all monetary/decimal fields (NOT double/float)\n"
+            "- Do NOT use update_todo_list. Just create files directly.\n"
+            "- ONE file per response. Use write_to_file for new files."
+        )
+
+    if guidance:
+        result = list(messages)
+        # Insert before last user message
+        for i in range(len(result) - 1, -1, -1):
+            if result[i].get("role") == "user":
+                result.insert(i, {"role": "system", "content": guidance})
+                logger.info(f"[{_ts()}] 📋 injected task guidance")
+                break
+        return result
+
+    return messages
+
+
 def compress_system_messages(messages: list[dict]) -> list[dict]:
     """
     Compress verbose system messages to save context budget.
@@ -1363,6 +1432,10 @@ async def proxy_chat_completions(request: Request) -> Response:
     # Detect diff failures and inject read_file guidance
     if "messages" in req_body:
         req_body["messages"] = inject_diff_failure_guidance(req_body["messages"])
+
+    # Inject domain-specific planning guidance for migration/planning requests
+    if "messages" in req_body:
+        req_body["messages"] = inject_task_guidance(req_body["messages"])
 
     # Auto-truncate if context too large
     if "messages" in req_body:
