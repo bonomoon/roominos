@@ -900,18 +900,36 @@ def repair_response(body: dict, req_tools: list[dict] | None = None) -> tuple[di
             elif isinstance(args_str, dict):
                 parsed_args = args_str
 
-            # 3. Transform arguments when tool was aliased (e.g. write_file → apply_diff)
-            if name_fixed and clean_name == "apply_diff" and isinstance(parsed_args, dict):
-                # Model sent write_file(path, content) → convert to apply_diff(path, diff)
-                if "content" in parsed_args and "path" in parsed_args:
-                    content = parsed_args["content"]
-                    path = parsed_args["path"]
-                    # Create a diff that adds the entire file content
-                    diff_content = f"--- /dev/null\n+++ {path}\n@@ -0,0 +1 @@\n+{content}"
+            # 3. Convert broken apply_diff to write_to_file when possible
+            if clean_name == "apply_diff" and isinstance(parsed_args, dict):
+                should_convert = False
+                # Case A: model sent write_file-style args (path + content, no diff)
+                if "content" in parsed_args and "diff" not in parsed_args:
+                    should_convert = True
+                # Case B: diff field exists but has wrong format (missing SEARCH/REPLACE markers)
+                elif "diff" in parsed_args:
+                    diff_str = str(parsed_args.get("diff", ""))
+                    if "<<<<<<< SEARCH" not in diff_str and "=======" not in diff_str:
+                        # Malformed diff — treat as content
+                        parsed_args["content"] = diff_str
+                        should_convert = True
+
+                if should_convert and "write_to_file" in valid_tool_names:
+                    fn["name"] = "write_to_file"
+                    clean_name = "write_to_file"
+                    new_args = {"path": parsed_args.get("path", ""), "content": parsed_args.get("content", "")}
+                    fn["arguments"] = json.dumps(new_args)
+                    repaired = True
+                    logger.info(f"[{_ts()}] 🔧 converted broken apply_diff → write_to_file")
+                elif should_convert:
+                    # write_to_file not available, try to make a valid diff
+                    content = parsed_args.get("content", parsed_args.get("diff", ""))
+                    path = parsed_args.get("path", "")
+                    diff_content = f"<<<<<<< SEARCH\n:start_line: 1\n-------\n\n=======\n{content}\n>>>>>>> REPLACE"
                     parsed_args = {"path": path, "diff": diff_content}
                     fn["arguments"] = json.dumps(parsed_args)
                     repaired = True
-                    logger.info(f"[{_ts()}] 🔧 transformed write_file args → apply_diff format")
+                    logger.info(f"[{_ts()}] 🔧 wrapped content in apply_diff format")
 
             # 4. Inject missing required parameters
             if clean_name and isinstance(parsed_args, dict):
