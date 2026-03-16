@@ -534,6 +534,79 @@ def check_context_budget(req_body: dict, warn_threshold: float = 0.4, max_contex
 
 
 # ---------------------------------------------------------------------------
+# Context auto-truncation
+# ---------------------------------------------------------------------------
+
+def truncate_context(messages: list[dict], max_tokens: int = 24000) -> tuple[list[dict], bool]:
+    """
+    Auto-truncate conversation when context exceeds budget.
+    Preserves: system messages, last 3 user/assistant pairs.
+    Removes: oldest non-system messages first.
+    """
+    total = sum(estimate_tokens(m) for m in messages)
+    if total <= max_tokens:
+        return messages, False
+
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    conv_msgs = [m for m in messages if m.get("role") != "system"]
+
+    keep_last = 6
+    if len(conv_msgs) <= keep_last:
+        return messages, False
+
+    trimmed = list(conv_msgs)
+    while len(trimmed) > keep_last:
+        new_total = sum(estimate_tokens(m) for m in system_msgs + trimmed)
+        if new_total <= max_tokens:
+            break
+        trimmed.pop(0)
+
+    result = system_msgs + trimmed
+    after_tokens = sum(estimate_tokens(m) for m in result)
+    if len(result) < len(messages):
+        logger.info(f"[{_ts()}] ✂ truncated: {len(messages)}→{len(result)} msgs, ~{after_tokens:,} tokens")
+    return result, len(result) < len(messages)
+
+
+# ---------------------------------------------------------------------------
+# Smart tool filtering by mode
+# ---------------------------------------------------------------------------
+
+def filter_tools_by_mode(tools: list[dict], system_content: str) -> list[dict]:
+    """Detect Roo Code mode from system message and filter tools to minimum set."""
+    if not system_content or not tools:
+        return tools
+
+    content_lower = system_content.lower()
+    mode_allowlist = {
+        "coder": {"read_file", "apply_diff", "write_to_file", "search_and_replace",
+                  "insert_content", "list_files", "attempt_completion"},
+        "reader": {"read_file", "search_files", "list_files",
+                   "list_code_definition_names", "attempt_completion"},
+        "runner": {"read_file", "execute_command", "list_files", "attempt_completion"},
+        "reviewer": {"read_file", "search_files", "list_files",
+                     "list_code_definition_names", "attempt_completion"},
+        "planner": {"read_file", "search_files", "list_files",
+                    "list_code_definition_names", "attempt_completion"},
+    }
+
+    detected = None
+    for mode in mode_allowlist:
+        if mode in content_lower:
+            detected = mode
+            break
+
+    if not detected:
+        return tools
+
+    allow = mode_allowlist[detected]
+    filtered = [t for t in tools if t.get("function", {}).get("name", "") in allow]
+    if filtered and len(filtered) < len(tools):
+        logger.info(f"[{_ts()}] 🔧 {detected} mode: tools {len(tools)}→{len(filtered)}")
+    return filtered if filtered else tools
+
+
+# ---------------------------------------------------------------------------
 # System prompt compression
 # ---------------------------------------------------------------------------
 
@@ -614,13 +687,13 @@ def sanitize_tool_name(name: str, valid_tools: set[str] | None = None) -> tuple[
     # Remove <|...|> tokens (common in weak model outputs)
     name = re.sub(r"<\|[^|]*\|>.*", "", name)
 
-    # Remove "functions." prefix
-    if name.startswith("functions."):
-        name = name[len("functions."):]
-
     # Remove "to=" prefix
     if name.startswith("to="):
         name = name[len("to="):]
+
+    # Remove "functions." prefix (check after "to=" strip to handle "to=functions.xxx")
+    if name.startswith("functions."):
+        name = name[len("functions."):]
 
     # Keep only valid tool name chars (alphanumeric + underscore)
     name = re.sub(r"[^a-zA-Z0-9_]", "", name)
@@ -654,7 +727,8 @@ def sanitize_tool_name(name: str, valid_tools: set[str] | None = None) -> tuple[
 # Aliases are resolved dynamically: target must exist in the request's tool list.
 # Multiple candidates are listed — the first match in valid_tools wins.
 _TOOL_NAME_ALIAS_CANDIDATES: dict[str, list[str]] = {
-    "write_file": ["write_to_file", "apply_diff"],       # 3.4.x has write_to_file, 3.51.x has apply_diff
+    "write_file": ["apply_diff", "write_to_file"],       # 3.51.x has apply_diff, 3.4.x has write_to_file
+    "write_to_file": ["apply_diff", "write_file"],       # alias to apply_diff when available
     "create_file": ["write_to_file", "apply_diff"],
     "edit_file": ["apply_diff", "replace_in_file", "search_and_replace"],
     "run_command": ["execute_command"],
@@ -664,7 +738,6 @@ _TOOL_NAME_ALIAS_CANDIDATES: dict[str, list[str]] = {
     "list": ["list_files"],
     "complete": ["attempt_completion"],
     "ask": ["ask_followup_question"],
-    "update_todo_list": ["attempt_completion"],
 }
 
 # Flat lookup built from candidates (first candidate is default)
@@ -1016,13 +1089,22 @@ async def proxy_chat_completions(request: Request) -> Response:
     tools = req_body.get("tools", [])
     original_tool_count = len(tools)
 
-    # Simplify tools
+    # Smart tool filtering by detected mode
+    system_content = next((m.get("content", "") for m in req_body.get("messages", []) if m.get("role") == "system"), "")
+    if tools and isinstance(system_content, str):
+        tools = filter_tools_by_mode(tools, system_content)
+
+    # Simplify remaining tools
     if tools:
         req_body["tools"] = simplify_tools(tools, config.max_tools)
 
     # Compress system messages to save context budget
     if "messages" in req_body:
         req_body["messages"] = compress_system_messages(req_body["messages"])
+
+    # Auto-truncate if context too large
+    if "messages" in req_body:
+        req_body["messages"], was_truncated = truncate_context(req_body["messages"])
 
     # Check context budget
     budget_warning = check_context_budget(req_body)

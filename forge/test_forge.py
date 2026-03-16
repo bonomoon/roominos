@@ -372,3 +372,94 @@ def test_models_passthrough(client):
 
     assert resp.status_code == 200
     assert resp.json()["data"][0]["id"] == "gpt-4"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: GPT-OSS-20B specific features
+# ---------------------------------------------------------------------------
+
+def test_reasoning_to_content_normalization():
+    """20B model puts output in reasoning field instead of content."""
+    from forge import normalize_reasoning_response
+    body = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "reasoning": "I will read the file now.",
+                "reasoning_details": [{"type": "reasoning.text", "text": "I will read the file now."}]
+            }
+        }]
+    }
+    result = normalize_reasoning_response(body)
+    assert result["choices"][0]["message"]["content"] == "I will read the file now."
+
+
+def test_tool_name_aliasing():
+    """20B outputs wrong tool names that need aliasing."""
+    from forge import sanitize_tool_name
+    valid = {"apply_diff", "read_file", "list_files", "attempt_completion"}
+
+    name, fixed = sanitize_tool_name("write_file", valid_tools=valid)
+    assert name == "apply_diff"
+    assert fixed is True
+
+    name, fixed = sanitize_tool_name("write_to_file", valid_tools=valid)
+    assert name == "apply_diff"
+    assert fixed is True
+
+    name, fixed = sanitize_tool_name("read_file", valid_tools=valid)
+    assert name == "read_file"
+    assert fixed is False
+
+
+def test_tool_name_sanitize_corrupted():
+    """20B outputs corrupted tool names with chat template tokens."""
+    from forge import sanitize_tool_name
+
+    name, fixed = sanitize_tool_name("update_todo_list<|channel|>commentary")
+    assert name == "update_todo_list"
+    assert fixed is True
+
+    name, fixed = sanitize_tool_name("functions.read_file")
+    assert name == "read_file"
+    assert fixed is True
+
+    name, fixed = sanitize_tool_name("to=functions.list_files")
+    assert name == "list_files"
+    assert fixed is True
+
+
+def test_extract_tool_calls_from_text():
+    """20B outputs tool calls as plain text instead of structured tool_calls."""
+    from forge import extract_tool_calls_from_text
+
+    tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]
+
+    # Case: to=functions.read_file pattern
+    body = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": 'to=functions.read_file\n{"path": "src/App.java"}',
+                "tool_calls": None
+            }
+        }]
+    }
+    result, extracted = extract_tool_calls_from_text(body, req_tools=tools)
+    assert extracted is True
+    assert result["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "read_file"
+
+    # Case: JSON name+arguments pattern
+    body2 = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": '{"name": "read_file", "arguments": {"path": "test.java"}}',
+                "tool_calls": None
+            }
+        }]
+    }
+    result2, extracted2 = extract_tool_calls_from_text(body2, req_tools=tools)
+    assert extracted2 is True
+    assert result2["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "read_file"
