@@ -1145,22 +1145,33 @@ def repair_response(body: dict, req_tools: list[dict] | None = None) -> tuple[di
             elif isinstance(args_str, dict):
                 parsed_args = args_str
 
-            # 3. Block unproductive tool calls
+            # 3. Limit todo.md writes — allow once, then block
             if isinstance(parsed_args, dict):
-                # Block todo.md writes
                 target_path = str(parsed_args.get("path", ""))
                 if "todo" in target_path.lower() and target_path.endswith(".md"):
-                    fn["name"] = "attempt_completion"
-                    fn["arguments"] = json.dumps({"result": "Skipping todo.md — proceed to create actual code files."})
-                    repaired = True
-                    logger.info(f"[{_ts()}] 🚫 blocked todo.md write")
+                    if not hasattr(config, '_todo_written'):
+                        config._todo_written = False
+                    if config._todo_written:
+                        fn["name"] = "attempt_completion"
+                        fn["arguments"] = json.dumps({"result": "Todo already created. Now create actual code files starting with pom.xml."})
+                        repaired = True
+                        logger.info(f"[{_ts()}] 🚫 blocked repeat todo.md write")
+                    else:
+                        config._todo_written = True
+                        logger.info(f"[{_ts()}] 📝 todo.md write allowed (first time)")
 
-            # Block ask_followup_question during coding — just proceed
+            # Limit ask_followup_question — allow once, then block
             if clean_name == "ask_followup_question":
-                fn["name"] = "attempt_completion"
-                fn["arguments"] = json.dumps({"result": "Proceeding with file creation. Start with pom.xml or the next required file."})
-                repaired = True
-                logger.info(f"[{_ts()}] 🚫 blocked ask_followup_question → proceed with coding")
+                if not hasattr(config, '_question_count'):
+                    config._question_count = 0
+                config._question_count += 1
+                if config._question_count > 1:
+                    fn["name"] = "attempt_completion"
+                    fn["arguments"] = json.dumps({"result": "Question already asked. Proceed with creating code files."})
+                    repaired = True
+                    logger.info(f"[{_ts()}] 🚫 blocked repeat question (#{config._question_count})")
+                else:
+                    logger.info(f"[{_ts()}] ❓ question allowed (first time)")
 
             # 4. Convert broken apply_diff to write_to_file when possible
             if clean_name == "apply_diff" and isinstance(parsed_args, dict):
