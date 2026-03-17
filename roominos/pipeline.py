@@ -220,6 +220,33 @@ class Pipeline:
                 changed = True
                 issues_found += 1
 
+            # Add @SpringBootTest to test files missing it
+            if "Test.java" in path and "@SpringBootTest" not in content and "class " in content:
+                content = content.replace(
+                    "import org.junit.jupiter.api.Test;",
+                    "import org.junit.jupiter.api.Test;\nimport org.springframework.boot.test.context.SpringBootTest;\nimport org.springframework.test.context.ActiveProfiles;",
+                    1
+                )
+                # Add annotation before class declaration
+                import re as _re
+                content = _re.sub(
+                    r'((?:@\w+.*\n)*)(\s*(?:public\s+)?class\s+\w+Test)',
+                    r'\1@SpringBootTest\n@ActiveProfiles("test")\n\2',
+                    content, count=1
+                )
+                changed = True
+                issues_found += 1
+
+            # Add @Transactional to service classes missing it
+            if "Service.java" in path and "Test" not in path and "@Transactional" not in content and "@Service" in content:
+                content = content.replace(
+                    "@Service",
+                    "@Service\n@org.springframework.transaction.annotation.Transactional",
+                    1
+                )
+                changed = True
+                issues_found += 1
+
             if changed:
                 with open(full, 'w') as f:
                     f.write(content)
