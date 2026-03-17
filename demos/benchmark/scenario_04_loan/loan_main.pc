@@ -1,0 +1,620 @@
+/*******************************************************************************
+ * loan_main.pc - 대출 신청/관리 메인
+ *
+ * 작성일: 2009-11-10
+ * 수정일: 2014-03-20  최차장 - 담보대출 접수 추가
+ * 수정일: 2017-09-15  김대리 - 상태 전이 규칙 강화
+ * 수정일: 2020-06-01  박과장 - 실행(disbursement) 로직
+ * 수정일: 2022-11-30  이사원 - 배치 조회 기능
+ *
+ * 대출 신청 접수, 상태 관리, 실행 처리
+ ******************************************************************************/
+
+#include "loan_common.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    char    h_loan_no[MAX_LOAN_NO];
+    char    h_cust_no[MAX_CUST_NO];
+    char    h_cust_name[MAX_CUST_NAME];
+    char    h_prod_code[MAX_PROD_CODE];
+    char    h_prod_name[MAX_PROD_NAME];
+    char    h_loan_type[3];
+    double  h_request_amt;
+    double  h_approved_amt;
+    double  h_interest_rate;
+    char    h_rate_type[2];
+    int     h_loan_term;
+    int     h_grace_months;
+    char    h_repay_type[2];
+    char    h_status[3];
+    char    h_apply_date[MAX_DATE_LEN];
+    char    h_approve_date[MAX_DATE_LEN];
+    char    h_disburse_date[MAX_DATE_LEN];
+    char    h_maturity_date[MAX_DATE_LEN];
+    char    h_branch_code[MAX_BRANCH_CODE];
+    char    h_note[MAX_NOTE];
+    char    h_reg_user[20];
+    char    h_reg_date[MAX_DATETIME_LEN];
+    char    h_upd_user[20];
+    char    h_upd_date[MAX_DATETIME_LEN];
+    /* 담보 */
+    char    h_coll_type[5];
+    char    h_coll_desc[100];
+    double  h_appraised_value;
+    double  h_recognition_rate;
+    double  h_prior_lien;
+    /* 카운트/금액 */
+    int     h_count;
+    double  h_total_amt;
+    /* DB 접속 */
+    char    h_db_user[50];
+    char    h_db_pass[50];
+    char    h_db_name[50];
+EXEC SQL END DECLARE SECTION;
+
+/* 전역 변수 */
+static int  g_connected = 0;
+static char g_user_id[20] = "SYSTEM";
+
+/* 2017-09-15 사용안함 - 예전 상태전이 테이블 */
+/* static char *g_old_transitions[][2] = { {"10","30"}, {"30","50"}, ... }; */
+
+/*******************************************************************************
+ * DB 접속
+ ******************************************************************************/
+static int loan_db_connect(const char *user, const char *pass, const char *db)
+{
+    if (g_connected) return LOAN_SUCCESS;
+
+    LN_STRCPY(h_db_user, user, sizeof(h_db_user));
+    LN_STRCPY(h_db_pass, pass, sizeof(h_db_pass));
+    LN_STRCPY(h_db_name, db, sizeof(h_db_name));
+
+    EXEC SQL CONNECT :h_db_user IDENTIFIED BY :h_db_pass USING :h_db_name;
+
+    if (sqlca.sqlcode != 0) {
+        LN_ERROR("DB connect failed: %.*s", (int)sqlca.sqlerrm.sqlerrml, sqlca.sqlerrm.sqlerrmc);
+        return LOAN_ERR_DB;
+    }
+
+    g_connected = 1;
+    return LOAN_SUCCESS;
+}
+
+static void loan_db_disconnect(void)
+{
+    if (!g_connected) return;
+    EXEC SQL COMMIT WORK RELEASE;
+    g_connected = 0;
+}
+
+/*******************************************************************************
+ * generate_loan_no - 대출번호 채번
+ ******************************************************************************/
+static int generate_loan_no(char *loan_no, int loan_no_len)
+{
+    EXEC SQL SELECT 'LN' || TO_CHAR(SYSDATE, 'YYYYMMDD') || LPAD(SEQ_LOAN_NO.NEXTVAL, 6, '0')
+        INTO :h_loan_no FROM DUAL;
+
+    if (sqlca.sqlcode != 0) {
+        LN_ERROR("Loan number generation failed");
+        return LOAN_ERR_DB;
+    }
+
+    LN_STRCPY(loan_no, h_loan_no, loan_no_len);
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * load_collaterals - 담보 정보 로드
+ ******************************************************************************/
+static int load_collaterals(const char *loan_no, COLLATERAL_INFO *colls, int *cnt)
+{
+    int idx = 0;
+
+    LN_STRCPY(h_loan_no, loan_no, sizeof(h_loan_no));
+
+    EXEC SQL DECLARE cur_coll CURSOR FOR
+        SELECT COLLATERAL_TYPE, COLLATERAL_DESC, APPRAISED_VALUE,
+               RECOGNITION_RATE, NVL(PRIOR_LIEN_AMT, 0)
+        FROM   TB_LOAN_COLLATERAL
+        WHERE  LOAN_NO = :h_loan_no
+        ORDER BY COLLATERAL_TYPE;
+
+    EXEC SQL OPEN cur_coll;
+    if (sqlca.sqlcode != 0) return LOAN_ERR_DB;
+
+    while (idx < MAX_COLLATERAL_CNT) {
+        EXEC SQL FETCH cur_coll
+            INTO :h_coll_type, :h_coll_desc, :h_appraised_value,
+                 :h_recognition_rate, :h_prior_lien;
+
+        if (sqlca.sqlcode == 1403) break;
+        if (sqlca.sqlcode != 0) { EXEC SQL CLOSE cur_coll; return LOAN_ERR_DB; }
+
+        LN_STRCPY(colls[idx].collateral_type, h_coll_type, sizeof(colls[idx].collateral_type));
+        LN_STRCPY(colls[idx].collateral_desc, h_coll_desc, sizeof(colls[idx].collateral_desc));
+        colls[idx].appraised_value = h_appraised_value;
+        colls[idx].recognition_rate = h_recognition_rate;
+        colls[idx].collateral_value = h_appraised_value * h_recognition_rate;
+        colls[idx].prior_lien_amt = h_prior_lien;
+        colls[idx].available_amt = colls[idx].collateral_value - h_prior_lien;
+        if (colls[idx].available_amt < 0) colls[idx].available_amt = 0;
+        idx++;
+    }
+
+    EXEC SQL CLOSE cur_coll;
+    *cnt = idx;
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * loan_apply - 대출 신청 접수
+ ******************************************************************************/
+int loan_apply(LOAN_APPLICATION *app)
+{
+    CREDIT_INFO credit;
+    APPROVAL_RESULT approval;
+    int rc;
+    char log_buf[256];
+
+    LN_CHECK_NULL(app);
+
+    /* 대출번호 채번 */
+    rc = generate_loan_no(app->loan_no, sizeof(app->loan_no));
+    if (rc != LOAN_SUCCESS) return rc;
+
+    /* 신용 조회 */
+    rc = credit_inquiry(app->cust_no, &credit);
+    if (rc != LOAN_SUCCESS) {
+        LN_ERROR("Credit inquiry failed: cust=%s rc=%d", app->cust_no, rc);
+        return LOAN_ERR_CREDIT;
+    }
+    memcpy(&app->credit, &credit, sizeof(CREDIT_INFO));
+
+    EXEC SQL SAVEPOINT sp_loan_apply;
+
+    /* 신청 정보 INSERT */
+    LN_STRCPY(h_loan_no, app->loan_no, sizeof(h_loan_no));
+    LN_STRCPY(h_cust_no, app->cust_no, sizeof(h_cust_no));
+    LN_STRCPY(h_prod_code, app->prod_code, sizeof(h_prod_code));
+    LN_STRCPY(h_loan_type, app->loan_type, sizeof(h_loan_type));
+    h_request_amt = app->request_amt;
+    h_interest_rate = app->interest_rate;
+    h_rate_type[0] = app->rate_type;
+    h_rate_type[1] = '\0';
+    h_loan_term = app->loan_term_months;
+    h_grace_months = app->grace_months;
+    h_repay_type[0] = app->repay_type;
+    h_repay_type[1] = '\0';
+    LN_STRCPY(h_status, LOAN_STATUS_APPLY, sizeof(h_status));
+    LN_STRCPY(h_branch_code, app->branch_code, sizeof(h_branch_code));
+    LN_STRCPY(h_note, app->note, sizeof(h_note));
+    LN_STRCPY(h_reg_user, g_user_id, sizeof(h_reg_user));
+
+    EXEC SQL INSERT INTO TB_LOAN_APPLICATION (
+        LOAN_NO, CUST_NO, PROD_CODE, LOAN_TYPE,
+        REQUEST_AMT, INTEREST_RATE, RATE_TYPE,
+        LOAN_TERM, GRACE_MONTHS, REPAY_TYPE,
+        STATUS, APPLY_DATE, BRANCH_CODE, NOTE,
+        REG_USER, REG_DATE
+    ) VALUES (
+        :h_loan_no, :h_cust_no, :h_prod_code, :h_loan_type,
+        :h_request_amt, :h_interest_rate, :h_rate_type,
+        :h_loan_term, :h_grace_months, :h_repay_type,
+        :h_status, SYSDATE, :h_branch_code, :h_note,
+        :h_reg_user, SYSDATE
+    );
+
+    if (sqlca.sqlcode != 0) {
+        LN_ERROR("Insert loan application failed: sqlcode=%ld", sqlca.sqlcode);
+        EXEC SQL ROLLBACK TO SAVEPOINT sp_loan_apply;
+        return LOAN_ERR_DB_INSERT;
+    }
+
+    /* 담보 정보 INSERT (담보대출인 경우) */
+    if (strcmp(app->loan_type, LOAN_TYPE_MORTGAGE) == 0 ||
+        strcmp(app->loan_type, LOAN_TYPE_AUTO) == 0) {
+        int i;
+        double total_coll = 0;
+
+        for (i = 0; i < app->collateral_cnt; i++) {
+            LN_STRCPY(h_coll_type, app->collaterals[i].collateral_type, sizeof(h_coll_type));
+            LN_STRCPY(h_coll_desc, app->collaterals[i].collateral_desc, sizeof(h_coll_desc));
+            h_appraised_value = app->collaterals[i].appraised_value;
+            h_recognition_rate = app->collaterals[i].recognition_rate;
+            h_prior_lien = app->collaterals[i].prior_lien_amt;
+
+            EXEC SQL INSERT INTO TB_LOAN_COLLATERAL (
+                LOAN_NO, SEQ, COLLATERAL_TYPE, COLLATERAL_DESC,
+                APPRAISED_VALUE, RECOGNITION_RATE, PRIOR_LIEN_AMT,
+                REG_USER, REG_DATE
+            ) VALUES (
+                :h_loan_no, :i + 1, :h_coll_type, :h_coll_desc,
+                :h_appraised_value, :h_recognition_rate, :h_prior_lien,
+                :h_reg_user, SYSDATE
+            );
+
+            if (sqlca.sqlcode != 0) {
+                LN_WARN("Collateral insert failed: seq=%d", i + 1);
+            }
+
+            total_coll += app->collaterals[i].available_amt;
+        }
+        app->total_collateral_value = total_coll;
+    }
+
+    /* 신용정보 저장 */
+    EXEC SQL INSERT INTO TB_LOAN_CREDIT_HIST (
+        LOAN_NO, CUST_NO, CREDIT_GRADE, CREDIT_SCORE,
+        ANNUAL_INCOME, EXIST_LOAN_CNT, EXIST_LOAN_BAL,
+        OVERDUE_CNT_1Y, OVERDUE_CNT_3Y, INQUIRY_DATE,
+        REG_DATE
+    ) VALUES (
+        :h_loan_no, :h_cust_no, :credit.credit_grade, :credit.credit_score,
+        :credit.annual_income, :credit.exist_loan_cnt, :credit.exist_loan_balance,
+        :credit.overdue_cnt_1y, :credit.overdue_cnt_3y, SYSDATE,
+        SYSDATE
+    );
+
+    /* 신용정보 INSERT 실패해도 진행 */
+    if (sqlca.sqlcode != 0) {
+        LN_WARN("Credit history insert failed for %s", app->loan_no);
+    }
+
+    /* 자동 심사 (신청 즉시) */
+    rc = loan_approve_check(app, &approval);
+    if (rc == LOAN_SUCCESS) {
+        if (approval.decision == 'A') {
+            /* 승인 */
+            app->approved_amt = approval.approved_amt;
+            app->interest_rate = approval.approved_rate;
+            loan_update_status(app->loan_no, LOAN_STATUS_APPROVED, "AUTO_APPROVE");
+
+            /* 승인금액/금리 업데이트 */
+            h_approved_amt = approval.approved_amt;
+            h_interest_rate = approval.approved_rate;
+            EXEC SQL UPDATE TB_LOAN_APPLICATION
+            SET    APPROVED_AMT = :h_approved_amt,
+                   INTEREST_RATE = :h_interest_rate,
+                   APPROVE_DATE = SYSDATE,
+                   UPD_USER = 'AUTO_APPROVE',
+                   UPD_DATE = SYSDATE
+            WHERE  LOAN_NO = :h_loan_no;
+
+            sprintf(log_buf, "Auto approved: %s amt=%.0f rate=%.2f%%", app->loan_no, approval.approved_amt, approval.approved_rate);
+            LN_INFO("%s", log_buf);
+        } else if (approval.decision == 'R') {
+            /* 거절 */
+            loan_update_status(app->loan_no, LOAN_STATUS_REJECTED, "AUTO_REJECT");
+            LN_INFO("Auto rejected: %s reason=%s", app->loan_no, approval.reason);
+        } else {
+            /* 조건부 - 수동 심사 필요 */
+            loan_update_status(app->loan_no, LOAN_STATUS_REVIEW, "AUTO_REVIEW");
+            LN_INFO("Manual review required: %s", app->loan_no);
+        }
+    }
+
+    EXEC SQL COMMIT;
+    LN_INFO("Loan application received: %s", app->loan_no);
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * loan_select - 대출 조회
+ ******************************************************************************/
+int loan_select(const char *loan_no, LOAN_APPLICATION *app)
+{
+    int rc;
+
+    LN_CHECK_NULL(loan_no);
+    LN_CHECK_NULL(app);
+    memset(app, 0, sizeof(LOAN_APPLICATION));
+
+    LN_STRCPY(h_loan_no, loan_no, sizeof(h_loan_no));
+
+    EXEC SQL SELECT
+        L.LOAN_NO, L.CUST_NO, L.PROD_CODE, L.LOAN_TYPE,
+        L.REQUEST_AMT, NVL(L.APPROVED_AMT, 0), L.INTEREST_RATE,
+        L.RATE_TYPE, L.LOAN_TERM, NVL(L.GRACE_MONTHS, 0),
+        L.REPAY_TYPE, L.STATUS,
+        TO_CHAR(L.APPLY_DATE, 'YYYY-MM-DD'),
+        NVL(TO_CHAR(L.APPROVE_DATE, 'YYYY-MM-DD'), ' '),
+        NVL(TO_CHAR(L.DISBURSE_DATE, 'YYYY-MM-DD'), ' '),
+        NVL(TO_CHAR(L.MATURITY_DATE, 'YYYY-MM-DD'), ' '),
+        L.BRANCH_CODE, NVL(L.NOTE, ' '),
+        L.REG_USER, TO_CHAR(L.REG_DATE, 'YYYY-MM-DD HH24:MI:SS'),
+        C.CUST_NAME
+    INTO
+        :h_loan_no, :h_cust_no, :h_prod_code, :h_loan_type,
+        :h_request_amt, :h_approved_amt, :h_interest_rate,
+        :h_rate_type, :h_loan_term, :h_grace_months,
+        :h_repay_type, :h_status,
+        :h_apply_date,
+        :h_approve_date,
+        :h_disburse_date,
+        :h_maturity_date,
+        :h_branch_code, :h_note,
+        :h_reg_user, :h_reg_date,
+        :h_cust_name
+    FROM   TB_LOAN_APPLICATION L
+    INNER JOIN TB_LOAN_CUSTOMER C ON L.CUST_NO = C.CUST_NO
+    WHERE  L.LOAN_NO = :h_loan_no;
+
+    if (sqlca.sqlcode == 1403) return LOAN_ERR_NOT_FOUND;
+    if (sqlca.sqlcode != 0) return LOAN_ERR_DB_SELECT;
+
+    LN_STRCPY(app->loan_no, h_loan_no, sizeof(app->loan_no));
+    LN_STRCPY(app->cust_no, h_cust_no, sizeof(app->cust_no));
+    LN_STRCPY(app->prod_code, h_prod_code, sizeof(app->prod_code));
+    LN_STRCPY(app->loan_type, h_loan_type, sizeof(app->loan_type));
+    app->request_amt = h_request_amt;
+    app->approved_amt = h_approved_amt;
+    app->interest_rate = h_interest_rate;
+    app->rate_type = h_rate_type[0];
+    app->loan_term_months = h_loan_term;
+    app->grace_months = h_grace_months;
+    app->repay_type = h_repay_type[0];
+    LN_STRCPY(app->status, h_status, sizeof(app->status));
+    LN_STRCPY(app->apply_date, h_apply_date, sizeof(app->apply_date));
+    LN_STRCPY(app->approve_date, h_approve_date, sizeof(app->approve_date));
+    LN_STRCPY(app->disburse_date, h_disburse_date, sizeof(app->disburse_date));
+    LN_STRCPY(app->maturity_date, h_maturity_date, sizeof(app->maturity_date));
+    LN_STRCPY(app->branch_code, h_branch_code, sizeof(app->branch_code));
+    LN_STRCPY(app->note, h_note, sizeof(app->note));
+    LN_STRCPY(app->credit.cust_name, h_cust_name, sizeof(app->credit.cust_name));
+
+    /* 담보 로드 */
+    rc = load_collaterals(loan_no, app->collaterals, &app->collateral_cnt);
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * loan_update_status - 상태 변경
+ *
+ * 상태 전이 규칙:
+ *   신청(10) -> 심사중(20), 승인(30), 거절(40)
+ *   심사중(20) -> 승인(30), 거절(40)
+ *   승인(30) -> 실행(50), 거절(40)
+ *   실행(50) -> 정상(60)
+ *   정상(60) -> 연체(70), 완제(80)
+ *   연체(70) -> 정상(60), 상각(90), 완제(80)
+ ******************************************************************************/
+int loan_update_status(const char *loan_no, const char *new_status, const char *user_id)
+{
+    char cur_status[3];
+    int valid = 0;
+
+    LN_CHECK_NULL(loan_no);
+    LN_CHECK_NULL(new_status);
+
+    LN_STRCPY(h_loan_no, loan_no, sizeof(h_loan_no));
+
+    EXEC SQL SELECT STATUS INTO :h_status
+        FROM TB_LOAN_APPLICATION
+        WHERE LOAN_NO = :h_loan_no
+        FOR UPDATE NOWAIT;
+
+    if (sqlca.sqlcode == 1403) return LOAN_ERR_NOT_FOUND;
+    if (sqlca.sqlcode != 0) return LOAN_ERR_DB;
+
+    LN_STRCPY(cur_status, h_status, sizeof(cur_status));
+
+    /* 전이 규칙 검증 */
+    if (strcmp(cur_status, LOAN_STATUS_APPLY) == 0) {
+        if (strcmp(new_status, LOAN_STATUS_REVIEW) == 0 || strcmp(new_status, LOAN_STATUS_APPROVED) == 0 || strcmp(new_status, LOAN_STATUS_REJECTED) == 0) valid = 1;
+    } else if (strcmp(cur_status, LOAN_STATUS_REVIEW) == 0) {
+        if (strcmp(new_status, LOAN_STATUS_APPROVED) == 0 || strcmp(new_status, LOAN_STATUS_REJECTED) == 0) valid = 1;
+    } else if (strcmp(cur_status, LOAN_STATUS_APPROVED) == 0) {
+        if (strcmp(new_status, LOAN_STATUS_DISBURSED) == 0 || strcmp(new_status, LOAN_STATUS_REJECTED) == 0) valid = 1;
+    } else if (strcmp(cur_status, LOAN_STATUS_DISBURSED) == 0) {
+        if (strcmp(new_status, LOAN_STATUS_NORMAL) == 0) valid = 1;
+    } else if (strcmp(cur_status, LOAN_STATUS_NORMAL) == 0) {
+        if (strcmp(new_status, LOAN_STATUS_OVERDUE) == 0 || strcmp(new_status, LOAN_STATUS_CLOSED) == 0) valid = 1;
+    } else if (strcmp(cur_status, LOAN_STATUS_OVERDUE) == 0) {
+        if (strcmp(new_status, LOAN_STATUS_NORMAL) == 0 || strcmp(new_status, LOAN_STATUS_WRITEOFF) == 0 || strcmp(new_status, LOAN_STATUS_CLOSED) == 0) valid = 1;
+    }
+
+    if (!valid) {
+        LN_ERROR("Invalid status transition: %s -> %s (loan=%s)", cur_status, new_status, loan_no);
+        EXEC SQL ROLLBACK;
+        return LOAN_ERR_STATUS;
+    }
+
+    LN_STRCPY(h_status, new_status, sizeof(h_status));
+    LN_STRCPY(h_upd_user, user_id ? user_id : g_user_id, sizeof(h_upd_user));
+
+    EXEC SQL UPDATE TB_LOAN_APPLICATION
+    SET    STATUS   = :h_status,
+           UPD_USER = :h_upd_user,
+           UPD_DATE = SYSDATE
+    WHERE  LOAN_NO  = :h_loan_no;
+
+    if (sqlca.sqlcode != 0) {
+        EXEC SQL ROLLBACK;
+        return LOAN_ERR_DB_UPDATE;
+    }
+
+    /* 이력 기록 */
+    EXEC SQL INSERT INTO TB_LOAN_STATUS_HIST (LOAN_NO, OLD_STATUS, NEW_STATUS, CHG_USER, CHG_DATE)
+        VALUES (:h_loan_no, :cur_status, :h_status, :h_upd_user, SYSDATE);
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * loan_disburse - 대출 실행
+ ******************************************************************************/
+int loan_disburse(const char *loan_no, const char *user_id)
+{
+    LOAN_APPLICATION app;
+    REPAY_SCHEDULE schedule[MAX_SCHEDULE_CNT];
+    int sched_cnt = 0;
+    int rc, i;
+
+    LN_CHECK_NULL(loan_no);
+
+    rc = loan_select(loan_no, &app);
+    if (rc != LOAN_SUCCESS) return rc;
+
+    if (strcmp(app.status, LOAN_STATUS_APPROVED) != 0) {
+        LN_ERROR("Cannot disburse: status=%s (must be 30)", app.status);
+        return LOAN_ERR_STATUS;
+    }
+
+    /* 상환 스케줄 생성 */
+    rc = loan_calc_schedule(&app, schedule, &sched_cnt);
+    if (rc != LOAN_SUCCESS) {
+        LN_ERROR("Schedule calculation failed: rc=%d", rc);
+        return LOAN_ERR_CALC;
+    }
+
+    EXEC SQL SAVEPOINT sp_disburse;
+
+    /* 스케줄 저장 */
+    LN_STRCPY(h_loan_no, loan_no, sizeof(h_loan_no));
+    for (i = 0; i < sched_cnt; i++) {
+        EXEC SQL INSERT INTO TB_LOAN_SCHEDULE (
+            LOAN_NO, SEQ, DUE_DATE, PAYMENT, PRINCIPAL, INTEREST, BALANCE, PAID_YN
+        ) VALUES (
+            :h_loan_no, :schedule[i].seq,
+            TO_DATE(:schedule[i].due_date, 'YYYY-MM-DD'),
+            :schedule[i].payment, :schedule[i].principal,
+            :schedule[i].interest, :schedule[i].balance, 'N'
+        );
+
+        if (sqlca.sqlcode != 0) {
+            LN_ERROR("Schedule insert failed: seq=%d", schedule[i].seq);
+            EXEC SQL ROLLBACK TO SAVEPOINT sp_disburse;
+            return LOAN_ERR_DB_INSERT;
+        }
+    }
+
+    /* 만기일 설정 */
+    if (sched_cnt > 0) {
+        LN_STRCPY(h_maturity_date, schedule[sched_cnt - 1].due_date, sizeof(h_maturity_date));
+    }
+
+    /* 상태 변경 + 실행일/만기일 업데이트 */
+    EXEC SQL UPDATE TB_LOAN_APPLICATION
+    SET    STATUS = '50',
+           DISBURSE_DATE = SYSDATE,
+           MATURITY_DATE = TO_DATE(:h_maturity_date, 'YYYY-MM-DD'),
+           UPD_USER = :h_upd_user,
+           UPD_DATE = SYSDATE
+    WHERE  LOAN_NO = :h_loan_no;
+
+    if (sqlca.sqlcode != 0) {
+        EXEC SQL ROLLBACK TO SAVEPOINT sp_disburse;
+        return LOAN_ERR_DB_UPDATE;
+    }
+
+    EXEC SQL COMMIT;
+    LN_INFO("Loan disbursed: %s amt=%.0f term=%d schedule=%d rows", loan_no, app.approved_amt, app.loan_term_months, sched_cnt);
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * loan_search_by_status - 상태별 대출 목록 조회
+ ******************************************************************************/
+int loan_search_by_status(const char *status, LOAN_APPLICATION *list, int *cnt)
+{
+    int idx = 0;
+
+    LN_CHECK_NULL(status);
+    LN_CHECK_NULL(list);
+    LN_CHECK_NULL(cnt);
+
+    LN_STRCPY(h_status, status, sizeof(h_status));
+
+    EXEC SQL DECLARE cur_by_status CURSOR FOR
+        SELECT L.LOAN_NO, L.CUST_NO, C.CUST_NAME, L.LOAN_TYPE,
+               L.REQUEST_AMT, NVL(L.APPROVED_AMT, 0), L.INTEREST_RATE,
+               L.STATUS, TO_CHAR(L.APPLY_DATE, 'YYYY-MM-DD'), L.BRANCH_CODE
+        FROM   TB_LOAN_APPLICATION L
+        INNER JOIN TB_LOAN_CUSTOMER C ON L.CUST_NO = C.CUST_NO
+        WHERE  L.STATUS = :h_status
+        ORDER BY L.APPLY_DATE DESC;
+
+    EXEC SQL OPEN cur_by_status;
+    if (sqlca.sqlcode != 0) return LOAN_ERR_DB;
+
+    while (idx < MAX_ARRAY_SIZE) {
+        EXEC SQL FETCH cur_by_status
+            INTO :h_loan_no, :h_cust_no, :h_cust_name, :h_loan_type,
+                 :h_request_amt, :h_approved_amt, :h_interest_rate,
+                 :h_status, :h_apply_date, :h_branch_code;
+
+        if (sqlca.sqlcode == 1403) break;
+        if (sqlca.sqlcode != 0) { EXEC SQL CLOSE cur_by_status; return LOAN_ERR_DB; }
+
+        memset(&list[idx], 0, sizeof(LOAN_APPLICATION));
+        LN_STRCPY(list[idx].loan_no, h_loan_no, sizeof(list[idx].loan_no));
+        LN_STRCPY(list[idx].cust_no, h_cust_no, sizeof(list[idx].cust_no));
+        LN_STRCPY(list[idx].credit.cust_name, h_cust_name, sizeof(list[idx].credit.cust_name));
+        LN_STRCPY(list[idx].loan_type, h_loan_type, sizeof(list[idx].loan_type));
+        list[idx].request_amt = h_request_amt;
+        list[idx].approved_amt = h_approved_amt;
+        list[idx].interest_rate = h_interest_rate;
+        LN_STRCPY(list[idx].status, h_status, sizeof(list[idx].status));
+        LN_STRCPY(list[idx].apply_date, h_apply_date, sizeof(list[idx].apply_date));
+        LN_STRCPY(list[idx].branch_code, h_branch_code, sizeof(list[idx].branch_code));
+        idx++;
+    }
+
+    EXEC SQL CLOSE cur_by_status;
+    *cnt = idx;
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * main
+ ******************************************************************************/
+int main(int argc, char *argv[])
+{
+    LOAN_APPLICATION app;
+    int rc, cnt;
+
+    rc = loan_db_connect("LOAN_USER", "LOAN_PASS", "LOANDB");
+    if (rc != LOAN_SUCCESS) { fprintf(stderr, "DB connect failed\n"); return 1; }
+
+    if (argc < 2) {
+        printf("Usage: %s <command> [args...]\n", argv[0]);
+        printf("  select  <loan_no>       - View loan\n");
+        printf("  search  <status>        - Search by status\n");
+        printf("  disburse <loan_no>      - Execute loan\n");
+        loan_db_disconnect();
+        return 0;
+    }
+
+    if (strcmp(argv[1], "select") == 0 && argc >= 3) {
+        rc = loan_select(argv[2], &app);
+        if (rc == LOAN_SUCCESS) {
+            printf("Loan: %s  Cust: %s  Type: %s  Status: %s\n", app.loan_no, app.credit.cust_name, app.loan_type, app.status);
+            printf("Request: %.0f  Approved: %.0f  Rate: %.2f%%\n", app.request_amt, app.approved_amt, app.interest_rate);
+            printf("Term: %d months  Grace: %d  Repay: %c\n", app.loan_term_months, app.grace_months, app.repay_type);
+        } else {
+            printf("Not found or error: rc=%d\n", rc);
+        }
+    } else if (strcmp(argv[1], "search") == 0 && argc >= 3) {
+        LOAN_APPLICATION list[100];
+        rc = loan_search_by_status(argv[2], list, &cnt);
+        if (rc == LOAN_SUCCESS) {
+            printf("Found %d loans with status %s\n", cnt, argv[2]);
+            for (int i = 0; i < cnt && i < 100; i++) {
+                printf("  %s  %s  %.0f  %s\n", list[i].loan_no, list[i].credit.cust_name, list[i].request_amt, list[i].apply_date);
+            }
+        }
+    } else if (strcmp(argv[1], "disburse") == 0 && argc >= 3) {
+        rc = loan_disburse(argv[2], g_user_id);
+        printf("Disburse result: rc=%d\n", rc);
+    }
+
+    loan_db_disconnect();
+    return 0;
+}

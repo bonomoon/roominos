@@ -1,0 +1,301 @@
+/*******************************************************************************
+ * credit_check.pc - 신용 조회 모듈
+ *
+ * 작성일: 2009-11-10
+ * 수정일: 2014-03-20  최차장 - 외부 신용기관 연동 시뮬레이션
+ * 수정일: 2017-09-15  김대리 - 블랙리스트 체크 분리
+ * 수정일: 2020-06-01  박과장 - 기존대출 잔액 조회 추가
+ *
+ * 신용 조회, 블랙리스트 체크, 기존 대출 조회
+ * 외부 시스템 호출 시뮬레이션 포함
+ ******************************************************************************/
+
+#include "loan_common.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    char    hc_cust_no[MAX_CUST_NO];
+    char    hc_cust_name[MAX_CUST_NAME];
+    int     hc_credit_grade;
+    int     hc_credit_score;
+    double  hc_annual_income;
+    int     hc_age;
+    char    hc_emp_type[2];
+    int     hc_emp_months;
+    int     hc_loan_cnt;
+    double  hc_loan_balance;
+    double  hc_monthly_repay;
+    int     hc_overdue_1y;
+    int     hc_overdue_3y;
+    long    hc_max_overdue_days;
+    char    hc_blacklist_yn[2];
+    char    hc_inquiry_date[MAX_DATE_LEN];
+    /* 외부 조회용 */
+    char    hc_ext_req_no[20];
+    char    hc_ext_status[5];
+    int     hc_count;
+    double  hc_amount;
+    /* 대출 상세 */
+    char    hc_loan_no[MAX_LOAN_NO];
+    char    hc_loan_status[3];
+    double  hc_loan_amt;
+    double  hc_loan_bal;
+    double  hc_repay_amt;
+EXEC SQL END DECLARE SECTION;
+
+/* 전역 - 외부 시스템 호출 카운터 */
+static int g_ext_call_count = 0;
+static int g_ext_call_timeout = 30;  /* 초 */
+
+/* 2014-03-20 사용안함 - 예전 직접 DB 조회 방식 */
+/* static int old_credit_check(const char *cust_no) { ... } */
+
+/*******************************************************************************
+ * simulate_external_call - 외부 신용기관 연동 시뮬레이션
+ *
+ * 실제로는 TCP/IP 소켓 또는 MQ로 KCB/NICE 연동
+ * 여기서는 DB 조회로 대체
+ ******************************************************************************/
+static int simulate_external_call(const char *cust_no, int *grade, int *score)
+{
+    g_ext_call_count++;
+
+    LN_STRCPY(hc_cust_no, cust_no, sizeof(hc_cust_no));
+
+    /* 외부 조회 요청번호 생성 */
+    EXEC SQL SELECT 'EXT' || TO_CHAR(SYSDATE, 'YYYYMMDDHH24MISS') || LPAD(:g_ext_call_count, 4, '0')
+        INTO :hc_ext_req_no FROM DUAL;
+
+    /* 조회 로그 기록 */
+    EXEC SQL INSERT INTO TB_LOAN_EXT_LOG (
+        REQ_NO, CUST_NO, REQ_TYPE, REQ_DATE, STATUS
+    ) VALUES (
+        :hc_ext_req_no, :hc_cust_no, 'CREDIT', SYSDATE, 'S'
+    );
+
+    /* 신용정보 조회 (DB에서 - 실제로는 외부 응답) */
+    EXEC SQL SELECT CREDIT_GRADE, CREDIT_SCORE
+        INTO :hc_credit_grade, :hc_credit_score
+        FROM TB_LOAN_CREDIT_MST
+        WHERE CUST_NO = :hc_cust_no;
+
+    if (sqlca.sqlcode == 1403) {
+        /* 신용정보 없음 - 기본값 */
+        *grade = 6;
+        *score = 500;
+
+        /* 응답 로그 */
+        EXEC SQL UPDATE TB_LOAN_EXT_LOG
+        SET    STATUS = 'N', RESP_DATE = SYSDATE
+        WHERE  REQ_NO = :hc_ext_req_no;
+
+        LN_WARN("No credit info found: cust=%s, using default (grade=6, score=500)", cust_no);
+        return LOAN_SUCCESS;
+    }
+
+    if (sqlca.sqlcode != 0) {
+        EXEC SQL UPDATE TB_LOAN_EXT_LOG
+        SET    STATUS = 'F', RESP_DATE = SYSDATE
+        WHERE  REQ_NO = :hc_ext_req_no;
+
+        LN_ERROR("External credit check failed: sqlcode=%ld", sqlca.sqlcode);
+        return LOAN_ERR_EXTERNAL;
+    }
+
+    *grade = hc_credit_grade;
+    *score = hc_credit_score;
+
+    /* 성공 로그 */
+    EXEC SQL UPDATE TB_LOAN_EXT_LOG
+    SET    STATUS = 'S', RESP_DATE = SYSDATE,
+           RESULT_DATA = 'G=' || :hc_credit_grade || ',S=' || :hc_credit_score
+    WHERE  REQ_NO = :hc_ext_req_no;
+
+    EXEC SQL COMMIT;  /* 로그는 즉시 커밋 */
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * credit_inquiry - 고객 신용 정보 종합 조회
+ *
+ * 1. 고객 기본정보 조회
+ * 2. 외부 신용기관 신용등급/점수 조회
+ * 3. 기존 대출 정보 조회
+ * 4. 연체 이력 조회
+ * 5. 블랙리스트 체크
+ ******************************************************************************/
+int credit_inquiry(const char *cust_no, CREDIT_INFO *info)
+{
+    int rc;
+    int ext_grade, ext_score;
+
+    LN_CHECK_NULL(cust_no);
+    LN_CHECK_NULL(info);
+    memset(info, 0, sizeof(CREDIT_INFO));
+
+    LN_STRCPY(hc_cust_no, cust_no, sizeof(hc_cust_no));
+    LN_STRCPY(info->cust_no, cust_no, sizeof(info->cust_no));
+
+    /* 1. 고객 기본정보 */
+    EXEC SQL SELECT
+        C.CUST_NAME, C.AGE,
+        NVL(C.ANNUAL_INCOME, 0),
+        NVL(C.EMP_TYPE, 'N'),
+        NVL(C.EMP_MONTHS, 0)
+    INTO
+        :hc_cust_name, :hc_age,
+        :hc_annual_income,
+        :hc_emp_type,
+        :hc_emp_months
+    FROM TB_LOAN_CUSTOMER C
+    WHERE C.CUST_NO = :hc_cust_no;
+
+    if (sqlca.sqlcode == 1403) {
+        LN_ERROR("Customer not found: %s", cust_no);
+        return LOAN_ERR_NOT_FOUND;
+    }
+    if (sqlca.sqlcode != 0) return LOAN_ERR_DB_SELECT;
+
+    LN_STRCPY(info->cust_name, hc_cust_name, sizeof(info->cust_name));
+    info->age = hc_age;
+    info->annual_income = hc_annual_income;
+    info->monthly_income = hc_annual_income / 12.0;
+    info->employment_type = hc_emp_type[0];
+    info->employment_months = hc_emp_months;
+
+    /* 2. 외부 신용 조회 */
+    rc = simulate_external_call(cust_no, &ext_grade, &ext_score);
+    if (rc != LOAN_SUCCESS) {
+        LN_WARN("External credit check failed, using DB fallback");
+        /* DB에서 직접 조회 시도 */
+        EXEC SQL SELECT NVL(CREDIT_GRADE, 6), NVL(CREDIT_SCORE, 500)
+            INTO :hc_credit_grade, :hc_credit_score
+            FROM TB_LOAN_CUSTOMER
+            WHERE CUST_NO = :hc_cust_no;
+
+        if (sqlca.sqlcode == 0) {
+            ext_grade = hc_credit_grade;
+            ext_score = hc_credit_score;
+        } else {
+            ext_grade = 6;
+            ext_score = 500;
+        }
+    }
+    info->credit_grade = ext_grade;
+    info->credit_score = ext_score;
+
+    /* 3. 기존 대출 정보 */
+    rc = credit_get_exist_loans(cust_no, &info->exist_loan_balance, &info->monthly_repayment, &info->exist_loan_cnt);
+    if (rc != LOAN_SUCCESS) {
+        LN_WARN("Exist loan query failed: cust=%s", cust_no);
+        /* 조회 실패시 0건으로 처리 */
+    }
+
+    /* 4. 연체 이력 조회 */
+    EXEC SQL SELECT
+        NVL(SUM(CASE WHEN OVERDUE_DATE >= ADD_MONTHS(SYSDATE, -12) THEN 1 ELSE 0 END), 0),
+        NVL(SUM(CASE WHEN OVERDUE_DATE >= ADD_MONTHS(SYSDATE, -36) THEN 1 ELSE 0 END), 0),
+        NVL(MAX(OVERDUE_DAYS), 0)
+    INTO :hc_overdue_1y, :hc_overdue_3y, :hc_max_overdue_days
+    FROM TB_LOAN_OVERDUE_HIST
+    WHERE CUST_NO = :hc_cust_no;
+
+    if (sqlca.sqlcode == 0) {
+        info->overdue_cnt_1y = hc_overdue_1y;
+        info->overdue_cnt_3y = hc_overdue_3y;
+        info->max_overdue_days = hc_max_overdue_days;
+    }
+
+    /* 5. 블랙리스트 체크 */
+    rc = credit_check_blacklist(cust_no, &hc_count);
+    info->blacklist_yn = (hc_count > 0) ? 'Y' : 'N';
+
+    /* 조회일자 */
+    {
+        time_t now = time(NULL);
+        struct tm *tm_now = localtime(&now);
+        snprintf(info->inquiry_date, sizeof(info->inquiry_date), "%04d-%02d-%02d",
+                 tm_now->tm_year + 1900, tm_now->tm_mon + 1, tm_now->tm_mday);
+    }
+
+    LN_INFO("Credit inquiry complete: cust=%s grade=%d score=%d income=%.0f loans=%d balance=%.0f overdue_1y=%d",
+            cust_no, info->credit_grade, info->credit_score, info->annual_income,
+            info->exist_loan_cnt, info->exist_loan_balance, info->overdue_cnt_1y);
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * credit_check_blacklist - 블랙리스트 체크
+ ******************************************************************************/
+int credit_check_blacklist(const char *cust_no, int *is_blacklisted)
+{
+    LN_CHECK_NULL(cust_no);
+    LN_CHECK_NULL(is_blacklisted);
+
+    LN_STRCPY(hc_cust_no, cust_no, sizeof(hc_cust_no));
+
+    EXEC SQL SELECT COUNT(*) INTO :hc_count
+        FROM TB_LOAN_BLACKLIST
+        WHERE CUST_NO = :hc_cust_no
+        AND   (EXPIRE_DATE IS NULL OR EXPIRE_DATE >= SYSDATE)
+        AND   STATUS = 'A';
+
+    if (sqlca.sqlcode != 0 && sqlca.sqlcode != 1403) {
+        LN_ERROR("Blacklist check failed: sqlcode=%ld", sqlca.sqlcode);
+        *is_blacklisted = 0;
+        return LOAN_ERR_DB_SELECT;
+    }
+
+    *is_blacklisted = hc_count;
+
+    if (hc_count > 0) {
+        LN_WARN("Customer is blacklisted: %s (%d records)", cust_no, hc_count);
+    }
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * credit_get_exist_loans - 기존 대출 정보 조회
+ *
+ * 해당 고객의 활성 대출 (실행~정상~연체) 잔액/월상환액 합산
+ ******************************************************************************/
+int credit_get_exist_loans(const char *cust_no, double *balance, double *monthly, int *cnt)
+{
+    LN_CHECK_NULL(cust_no);
+    LN_CHECK_NULL(balance);
+    LN_CHECK_NULL(monthly);
+    LN_CHECK_NULL(cnt);
+
+    *balance = 0;
+    *monthly = 0;
+    *cnt = 0;
+
+    LN_STRCPY(hc_cust_no, cust_no, sizeof(hc_cust_no));
+
+    /* 활성 대출 합산 */
+    EXEC SQL SELECT
+        COUNT(*),
+        NVL(SUM(L.APPROVED_AMT - NVL((SELECT SUM(S.PRINCIPAL) FROM TB_LOAN_SCHEDULE S WHERE S.LOAN_NO = L.LOAN_NO AND S.PAID_YN = 'Y'), 0)), 0),
+        NVL(SUM(NVL((SELECT S2.PAYMENT FROM TB_LOAN_SCHEDULE S2 WHERE S2.LOAN_NO = L.LOAN_NO AND S2.PAID_YN = 'N' AND ROWNUM = 1), 0)), 0)
+    INTO :hc_count, :hc_loan_balance, :hc_monthly_repay
+    FROM TB_LOAN_APPLICATION L
+    WHERE L.CUST_NO = :hc_cust_no
+    AND   L.STATUS IN ('50', '60', '70');
+
+    if (sqlca.sqlcode != 0 && sqlca.sqlcode != 1403) {
+        LN_ERROR("Exist loan query failed: sqlcode=%ld", sqlca.sqlcode);
+        return LOAN_ERR_DB_SELECT;
+    }
+
+    *cnt = hc_count;
+    *balance = hc_loan_balance;
+    *monthly = hc_monthly_repay;
+
+    LN_DEBUG("Exist loans: cust=%s cnt=%d balance=%.0f monthly=%.0f", cust_no, *cnt, *balance, *monthly);
+
+    return LOAN_SUCCESS;
+}

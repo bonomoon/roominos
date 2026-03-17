@@ -1,0 +1,571 @@
+/*******************************************************************************
+ * audit_main.pc - 감사 로그 관리 메인
+ *
+ * 작성일: 2011-04-15
+ * 수정일: 2016-02-20  최과장 - 개인정보 감사 로그 추가
+ * 수정일: 2019-10-10  김대리 - 통계 조회 기능
+ * 수정일: 2022-05-01  박사원 - 보안감사 연동, 배치 등록
+ *
+ * 감사 로그 CRUD, 기간별 검색, 통계, 파기
+ * Oracle Pro*C precompiler 필요
+ ******************************************************************************/
+
+#include "audit_types.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    long    ha_audit_seq;
+    char    ha_event_type[4];
+    char    ha_event_date[MAX_DATE_LEN];
+    char    ha_event_time[9];
+    char    ha_event_datetime[MAX_DATETIME_LEN];
+    char    ha_severity[2];
+    char    ha_user_id[MAX_USER_ID];
+    char    ha_user_name[MAX_USER_NAME];
+    char    ha_ip_addr[MAX_IP_ADDR];
+    char    ha_table_name[MAX_TABLE_NAME];
+    char    ha_column_name[MAX_COLUMN_NAME];
+    char    ha_old_value[MAX_OLD_VALUE];
+    char    ha_new_value[MAX_NEW_VALUE];
+    char    ha_action_desc[MAX_ACTION_DESC];
+    char    ha_result[2];
+    char    ha_session_id[30];
+    char    ha_menu_id[20];
+    char    ha_screen_id[20];
+    int     ha_affected_rows;
+    /* 검색 조건 */
+    char    ha_from_date[MAX_DATE_LEN];
+    char    ha_to_date[MAX_DATE_LEN];
+    /* 통계 */
+    int     ha_total_cnt;
+    int     ha_success_cnt;
+    int     ha_fail_cnt;
+    int     ha_unique_users;
+    int     ha_unique_ips;
+    /* DB 접속 */
+    char    ha_db_user[50];
+    char    ha_db_pass[50];
+    char    ha_db_name[50];
+    /* 카운트 */
+    int     ha_count;
+EXEC SQL END DECLARE SECTION;
+
+/* 전역 변수 */
+static int  g_connected = 0;
+static int  g_batch_mode = 0;
+static int  g_commit_count = 0;
+static FILE *g_logfp = NULL;
+
+/* 2016-02-20 사용안함 - 예전 로그 경로 */
+/* static char g_old_audit_path[] = "/app/audit/log/audit_old.log"; */
+
+/*******************************************************************************
+ * DB 접속
+ ******************************************************************************/
+static int audit_db_connect(const char *user, const char *pass, const char *db)
+{
+    if (g_connected) return AUDIT_SUCCESS;
+
+    AUD_STRCPY(ha_db_user, user, sizeof(ha_db_user));
+    AUD_STRCPY(ha_db_pass, pass, sizeof(ha_db_pass));
+    AUD_STRCPY(ha_db_name, db, sizeof(ha_db_name));
+
+    EXEC SQL CONNECT :ha_db_user IDENTIFIED BY :ha_db_pass USING :ha_db_name;
+
+    if (sqlca.sqlcode != 0) {
+        AUD_ERROR("DB connect failed: %.*s", (int)sqlca.sqlerrm.sqlerrml, sqlca.sqlerrm.sqlerrmc);
+        return AUDIT_ERR_DB;
+    }
+
+    g_connected = 1;
+    AUD_INFO("Database connected for audit");
+    return AUDIT_SUCCESS;
+}
+
+static void audit_db_disconnect(void)
+{
+    if (!g_connected) return;
+    EXEC SQL COMMIT WORK RELEASE;
+    g_connected = 0;
+}
+
+/*******************************************************************************
+ * audit_insert - 감사 로그 등록
+ *
+ * 감사 로그는 별도 autonomous transaction 으로 처리해야 하지만
+ * Pro*C에서는 제한이 있어 즉시 COMMIT 처리
+ ******************************************************************************/
+int audit_insert(const AUDIT_RECORD *record)
+{
+    AUD_CHECK_NULL(record);
+
+    /* 시퀀스 채번 */
+    EXEC SQL SELECT SEQ_AUDIT_LOG.NEXTVAL INTO :ha_audit_seq FROM DUAL;
+    if (sqlca.sqlcode != 0) {
+        AUD_ERROR("Audit sequence generation failed");
+        return AUDIT_ERR_DB;
+    }
+
+    AUD_STRCPY(ha_event_type, record->event_type, sizeof(ha_event_type));
+    ha_severity[0] = record->severity;
+    ha_severity[1] = '\0';
+    AUD_STRCPY(ha_user_id, record->user_id, sizeof(ha_user_id));
+    AUD_STRCPY(ha_user_name, record->user_name, sizeof(ha_user_name));
+    AUD_STRCPY(ha_ip_addr, record->ip_addr, sizeof(ha_ip_addr));
+    AUD_STRCPY(ha_table_name, record->table_name, sizeof(ha_table_name));
+    AUD_STRCPY(ha_column_name, record->column_name, sizeof(ha_column_name));
+    AUD_STRCPY(ha_old_value, record->old_value, sizeof(ha_old_value));
+    AUD_STRCPY(ha_new_value, record->new_value, sizeof(ha_new_value));
+    AUD_STRCPY(ha_action_desc, record->action_desc, sizeof(ha_action_desc));
+    ha_result[0] = record->result;
+    ha_result[1] = '\0';
+    AUD_STRCPY(ha_session_id, record->session_id, sizeof(ha_session_id));
+    AUD_STRCPY(ha_menu_id, record->menu_id, sizeof(ha_menu_id));
+    AUD_STRCPY(ha_screen_id, record->screen_id, sizeof(ha_screen_id));
+    ha_affected_rows = record->affected_rows;
+
+    EXEC SQL INSERT INTO TB_AUDIT_LOG (
+        AUDIT_SEQ, EVENT_TYPE, EVENT_DATE, EVENT_TIME,
+        SEVERITY, USER_ID, USER_NAME, IP_ADDR,
+        TABLE_NAME, COLUMN_NAME, OLD_VALUE, NEW_VALUE,
+        ACTION_DESC, RESULT, SESSION_ID,
+        MENU_ID, SCREEN_ID, AFFECTED_ROWS,
+        REG_DATE
+    ) VALUES (
+        :ha_audit_seq, :ha_event_type, TRUNC(SYSDATE), TO_CHAR(SYSDATE, 'HH24:MI:SS'),
+        :ha_severity, :ha_user_id, :ha_user_name, :ha_ip_addr,
+        :ha_table_name, :ha_column_name, :ha_old_value, :ha_new_value,
+        :ha_action_desc, :ha_result, :ha_session_id,
+        :ha_menu_id, :ha_screen_id, :ha_affected_rows,
+        SYSDATE
+    );
+
+    if (sqlca.sqlcode != 0) {
+        AUD_ERROR("Audit insert failed: sqlcode=%ld event=%s user=%s", sqlca.sqlcode, record->event_type, record->user_id);
+        return AUDIT_ERR_DB_INSERT;
+    }
+
+    /* 감사 로그는 즉시 커밋 (배치모드 제외) */
+    if (!g_batch_mode) {
+        EXEC SQL COMMIT;
+    }
+
+    /* 보안 이벤트 알림 (2022-05-01 추가) */
+    if (record->severity == SEV_CRITICAL ||
+        strcmp(record->event_type, EVT_SECURITY_ALERT) == 0 ||
+        strcmp(record->event_type, EVT_ABNORMAL_ACCESS) == 0) {
+        /* 보안 경고 테이블에 별도 기록 */
+        EXEC SQL INSERT INTO TB_AUDIT_SECURITY_ALERT (
+            AUDIT_SEQ, EVENT_TYPE, USER_ID, IP_ADDR, ACTION_DESC, ALERT_DATE, CONFIRM_YN
+        ) VALUES (
+            :ha_audit_seq, :ha_event_type, :ha_user_id, :ha_ip_addr, :ha_action_desc, SYSDATE, 'N'
+        );
+
+        if (sqlca.sqlcode != 0) {
+            AUD_WARN("Security alert insert failed (non-critical)");
+        } else if (!g_batch_mode) {
+            EXEC SQL COMMIT;
+        }
+
+        AUD_WARN("SECURITY ALERT: event=%s user=%s ip=%s desc=%s",
+                 record->event_type, record->user_id, record->ip_addr, record->action_desc);
+    }
+
+    return AUDIT_SUCCESS;
+}
+
+/*******************************************************************************
+ * audit_search - 감사 로그 검색
+ *
+ * 동적 WHERE 절 구성으로 다양한 조건 검색
+ * 2019-10-10 김대리 - 커서 기반 검색으로 변경
+ ******************************************************************************/
+int audit_search(const AUDIT_SEARCH *search, AUDIT_RECORD *records, int *cnt)
+{
+    int idx = 0;
+    int has_type = 0, has_user = 0, has_table = 0;
+    int has_ip = 0, has_severity = 0, has_result = 0;
+
+    AUD_CHECK_NULL(search);
+    AUD_CHECK_NULL(records);
+    AUD_CHECK_NULL(cnt);
+
+    AUD_STRCPY(ha_from_date, search->from_date[0] ? search->from_date : "2000-01-01", sizeof(ha_from_date));
+    AUD_STRCPY(ha_to_date, search->to_date[0] ? search->to_date : "2099-12-31", sizeof(ha_to_date));
+
+    /* 조건 플래그 */
+    has_type = (search->event_type[0] != '\0') ? 1 : 0;
+    has_user = (search->user_id[0] != '\0') ? 1 : 0;
+    has_table = (search->table_name[0] != '\0') ? 1 : 0;
+    has_ip = (search->ip_addr[0] != '\0') ? 1 : 0;
+    has_severity = (search->severity != 0) ? 1 : 0;
+    has_result = (search->result != 0) ? 1 : 0;
+
+    /* 조건별 호스트 변수 설정 */
+    if (has_type) AUD_STRCPY(ha_event_type, search->event_type, sizeof(ha_event_type));
+    else AUD_STRCPY(ha_event_type, "%", sizeof(ha_event_type));
+
+    if (has_user) AUD_STRCPY(ha_user_id, search->user_id, sizeof(ha_user_id));
+    else AUD_STRCPY(ha_user_id, "%", sizeof(ha_user_id));
+
+    if (has_table) AUD_STRCPY(ha_table_name, search->table_name, sizeof(ha_table_name));
+    else AUD_STRCPY(ha_table_name, "%", sizeof(ha_table_name));
+
+    if (has_ip) AUD_STRCPY(ha_ip_addr, search->ip_addr, sizeof(ha_ip_addr));
+    else AUD_STRCPY(ha_ip_addr, "%", sizeof(ha_ip_addr));
+
+    if (has_severity) { ha_severity[0] = search->severity; ha_severity[1] = '\0'; }
+    else AUD_STRCPY(ha_severity, "%", sizeof(ha_severity));
+
+    if (has_result) { ha_result[0] = search->result; ha_result[1] = '\0'; }
+    else AUD_STRCPY(ha_result, "%", sizeof(ha_result));
+
+    EXEC SQL DECLARE cur_audit CURSOR FOR
+        SELECT A.AUDIT_SEQ, A.EVENT_TYPE,
+               TO_CHAR(A.EVENT_DATE, 'YYYY-MM-DD'),
+               A.EVENT_TIME,
+               TO_CHAR(A.REG_DATE, 'YYYY-MM-DD HH24:MI:SS'),
+               A.SEVERITY, A.USER_ID,
+               NVL(A.USER_NAME, ' '),
+               NVL(A.IP_ADDR, ' '),
+               NVL(A.TABLE_NAME, ' '),
+               NVL(A.COLUMN_NAME, ' '),
+               NVL(A.OLD_VALUE, ' '),
+               NVL(A.NEW_VALUE, ' '),
+               NVL(A.ACTION_DESC, ' '),
+               A.RESULT,
+               NVL(A.SESSION_ID, ' '),
+               NVL(A.MENU_ID, ' '),
+               NVL(A.SCREEN_ID, ' '),
+               NVL(A.AFFECTED_ROWS, 0)
+        FROM   TB_AUDIT_LOG A
+        WHERE  A.EVENT_DATE BETWEEN TO_DATE(:ha_from_date, 'YYYY-MM-DD') AND TO_DATE(:ha_to_date, 'YYYY-MM-DD')
+        AND    A.EVENT_TYPE LIKE :ha_event_type
+        AND    A.USER_ID LIKE :ha_user_id
+        AND    NVL(A.TABLE_NAME, ' ') LIKE :ha_table_name
+        AND    NVL(A.IP_ADDR, ' ') LIKE :ha_ip_addr
+        AND    A.SEVERITY LIKE :ha_severity
+        AND    A.RESULT LIKE :ha_result
+        ORDER BY A.AUDIT_SEQ DESC;
+
+    EXEC SQL OPEN cur_audit;
+    if (sqlca.sqlcode != 0) {
+        AUD_ERROR("Audit search cursor open failed: sqlcode=%ld", sqlca.sqlcode);
+        return AUDIT_ERR_DB_SELECT;
+    }
+
+    while (idx < MAX_ARRAY_SIZE) {
+        if (search->limit > 0 && idx >= search->limit) break;
+
+        EXEC SQL FETCH cur_audit INTO
+            :ha_audit_seq, :ha_event_type,
+            :ha_event_date, :ha_event_time, :ha_event_datetime,
+            :ha_severity, :ha_user_id, :ha_user_name,
+            :ha_ip_addr, :ha_table_name, :ha_column_name,
+            :ha_old_value, :ha_new_value, :ha_action_desc,
+            :ha_result, :ha_session_id,
+            :ha_menu_id, :ha_screen_id, :ha_affected_rows;
+
+        if (sqlca.sqlcode == 1403) break;
+        if (sqlca.sqlcode != 0) {
+            AUD_ERROR("Audit fetch error: sqlcode=%ld at row %d", sqlca.sqlcode, idx);
+            break;
+        }
+
+        AUDIT_RECORD *rec = &records[idx];
+        memset(rec, 0, sizeof(AUDIT_RECORD));
+        rec->audit_seq = ha_audit_seq;
+        AUD_STRCPY(rec->event_type, ha_event_type, sizeof(rec->event_type));
+        AUD_STRCPY(rec->event_date, ha_event_date, sizeof(rec->event_date));
+        AUD_STRCPY(rec->event_time, ha_event_time, sizeof(rec->event_time));
+        AUD_STRCPY(rec->event_datetime, ha_event_datetime, sizeof(rec->event_datetime));
+        rec->severity = ha_severity[0];
+        AUD_STRCPY(rec->user_id, ha_user_id, sizeof(rec->user_id));
+        AUD_STRCPY(rec->user_name, ha_user_name, sizeof(rec->user_name));
+        AUD_STRCPY(rec->ip_addr, ha_ip_addr, sizeof(rec->ip_addr));
+        AUD_STRCPY(rec->table_name, ha_table_name, sizeof(rec->table_name));
+        AUD_STRCPY(rec->column_name, ha_column_name, sizeof(rec->column_name));
+        AUD_STRCPY(rec->old_value, ha_old_value, sizeof(rec->old_value));
+        AUD_STRCPY(rec->new_value, ha_new_value, sizeof(rec->new_value));
+        AUD_STRCPY(rec->action_desc, ha_action_desc, sizeof(rec->action_desc));
+        rec->result = ha_result[0];
+        AUD_STRCPY(rec->session_id, ha_session_id, sizeof(rec->session_id));
+        AUD_STRCPY(rec->menu_id, ha_menu_id, sizeof(rec->menu_id));
+        AUD_STRCPY(rec->screen_id, ha_screen_id, sizeof(rec->screen_id));
+        rec->affected_rows = ha_affected_rows;
+
+        idx++;
+    }
+
+    EXEC SQL CLOSE cur_audit;
+    *cnt = idx;
+
+    AUD_INFO("Audit search: %d records found (%s ~ %s)", idx, ha_from_date, ha_to_date);
+    return AUDIT_SUCCESS;
+}
+
+/*******************************************************************************
+ * audit_get_stat - 기간별 감사 통계
+ ******************************************************************************/
+int audit_get_stat(const char *from_date, const char *to_date,
+                   AUDIT_STAT *stats, int *cnt)
+{
+    int idx = 0;
+
+    AUD_CHECK_NULL(from_date);
+    AUD_CHECK_NULL(to_date);
+    AUD_CHECK_NULL(stats);
+    AUD_CHECK_NULL(cnt);
+
+    AUD_STRCPY(ha_from_date, from_date, sizeof(ha_from_date));
+    AUD_STRCPY(ha_to_date, to_date, sizeof(ha_to_date));
+
+    EXEC SQL DECLARE cur_stat CURSOR FOR
+        SELECT TO_CHAR(EVENT_DATE, 'YYYY-MM-DD'),
+               EVENT_TYPE,
+               COUNT(*),
+               SUM(CASE WHEN RESULT = 'S' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN RESULT = 'F' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN SEVERITY = 'I' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN SEVERITY = 'W' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN SEVERITY = 'E' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN SEVERITY = 'C' THEN 1 ELSE 0 END),
+               COUNT(DISTINCT USER_ID),
+               COUNT(DISTINCT IP_ADDR)
+        FROM   TB_AUDIT_LOG
+        WHERE  EVENT_DATE BETWEEN TO_DATE(:ha_from_date, 'YYYY-MM-DD')
+                              AND TO_DATE(:ha_to_date, 'YYYY-MM-DD')
+        GROUP BY TO_CHAR(EVENT_DATE, 'YYYY-MM-DD'), EVENT_TYPE
+        ORDER BY 1, 2;
+
+    EXEC SQL OPEN cur_stat;
+    if (sqlca.sqlcode != 0) return AUDIT_ERR_DB_SELECT;
+
+    while (idx < MAX_ARRAY_SIZE) {
+        EXEC SQL FETCH cur_stat INTO
+            :ha_event_date, :ha_event_type,
+            :ha_total_cnt, :ha_success_cnt, :ha_fail_cnt,
+            :ha_count, :ha_unique_users, :ha_unique_ips,
+            :ha_affected_rows,
+            :ha_unique_users, :ha_unique_ips;
+
+        if (sqlca.sqlcode == 1403) break;
+        if (sqlca.sqlcode != 0) break;
+
+        AUD_STRCPY(stats[idx].date, ha_event_date, sizeof(stats[idx].date));
+        AUD_STRCPY(stats[idx].event_type, ha_event_type, sizeof(stats[idx].event_type));
+        stats[idx].total_cnt = ha_total_cnt;
+        stats[idx].success_cnt = ha_success_cnt;
+        stats[idx].fail_cnt = ha_fail_cnt;
+        stats[idx].unique_users = ha_unique_users;
+        stats[idx].unique_ips = ha_unique_ips;
+        idx++;
+    }
+
+    EXEC SQL CLOSE cur_stat;
+    *cnt = idx;
+    return AUDIT_SUCCESS;
+}
+
+/*******************************************************************************
+ * audit_purge - 감사 로그 파기 (보존기한 경과분)
+ *
+ * before_date 이전 로그를 삭제
+ * COMMIT_UNIT 단위 커밋
+ ******************************************************************************/
+int audit_purge(const char *before_date, int *purged_cnt)
+{
+    int total = 0;
+    char log_buf[256];
+
+    AUD_CHECK_NULL(before_date);
+    AUD_CHECK_NULL(purged_cnt);
+
+    *purged_cnt = 0;
+    AUD_STRCPY(ha_from_date, before_date, sizeof(ha_from_date));
+
+    sprintf(log_buf, "=== Audit purge started: before %s ===", before_date);
+    AUD_INFO("%s", log_buf);
+
+    /* 파기 전 백업 확인 - 실제로는 백업 테이블에 복사 */
+    EXEC SQL SELECT COUNT(*) INTO :ha_count
+        FROM TB_AUDIT_LOG
+        WHERE EVENT_DATE < TO_DATE(:ha_from_date, 'YYYY-MM-DD');
+
+    if (sqlca.sqlcode != 0) return AUDIT_ERR_DB;
+    total = ha_count;
+
+    if (total == 0) {
+        AUD_INFO("No records to purge");
+        return AUDIT_SUCCESS;
+    }
+
+    AUD_INFO("Records to purge: %d", total);
+
+    /* 보안 경고 테이블 먼저 삭제 */
+    EXEC SQL DELETE FROM TB_AUDIT_SECURITY_ALERT
+        WHERE AUDIT_SEQ IN (
+            SELECT AUDIT_SEQ FROM TB_AUDIT_LOG
+            WHERE EVENT_DATE < TO_DATE(:ha_from_date, 'YYYY-MM-DD')
+        );
+
+    /* 메인 로그 삭제 */
+    EXEC SQL DELETE FROM TB_AUDIT_LOG
+        WHERE EVENT_DATE < TO_DATE(:ha_from_date, 'YYYY-MM-DD');
+
+    if (sqlca.sqlcode != 0 && sqlca.sqlcode != 1403) {
+        AUD_ERROR("Purge delete failed: sqlcode=%ld", sqlca.sqlcode);
+        EXEC SQL ROLLBACK;
+        return AUDIT_ERR_DB;
+    }
+
+    *purged_cnt = sqlca.sqlerrd[2];
+    EXEC SQL COMMIT;
+
+    sprintf(log_buf, "=== Audit purge completed: %d records deleted ===", *purged_cnt);
+    AUD_INFO("%s", log_buf);
+
+    return AUDIT_SUCCESS;
+}
+
+/*******************************************************************************
+ * audit_batch_register - 배치 감사 로그 등록 (다건)
+ ******************************************************************************/
+int audit_batch_register(AUDIT_RECORD *records, int cnt)
+{
+    int i, success = 0, fail = 0;
+    int rc;
+
+    AUD_CHECK_NULL(records);
+    if (cnt <= 0) return AUDIT_SUCCESS;
+
+    g_batch_mode = 1;
+    g_commit_count = 0;
+
+    AUD_INFO("Batch audit register: %d records", cnt);
+
+    for (i = 0; i < cnt; i++) {
+        rc = audit_insert(&records[i]);
+        if (rc == AUDIT_SUCCESS) {
+            success++;
+        } else {
+            fail++;
+        }
+
+        g_commit_count++;
+        if (g_commit_count >= COMMIT_UNIT) {
+            EXEC SQL COMMIT;
+            g_commit_count = 0;
+        }
+    }
+
+    if (g_commit_count > 0) {
+        EXEC SQL COMMIT;
+    }
+
+    g_batch_mode = 0;
+    AUD_INFO("Batch register complete: success=%d fail=%d", success, fail);
+
+    return AUDIT_SUCCESS;
+}
+
+/*******************************************************************************
+ * print_audit_record - 감사 레코드 출력
+ ******************************************************************************/
+static void print_audit_record(const AUDIT_RECORD *rec)
+{
+    printf("[%ld] %s %s %s %-4s %-15s %-15s %c %s\n",
+           rec->audit_seq,
+           rec->event_date, rec->event_time,
+           audit_severity_name(rec->severity),
+           rec->event_type, rec->user_id, rec->ip_addr,
+           rec->result, rec->action_desc);
+}
+
+/*******************************************************************************
+ * main
+ ******************************************************************************/
+int main(int argc, char *argv[])
+{
+    AUDIT_RECORD records[MAX_ARRAY_SIZE];
+    AUDIT_SEARCH search;
+    AUDIT_STAT stats[1000];
+    EXPORT_OPTION exp_opt;
+    int cnt, rc;
+
+    rc = audit_db_connect("AUDIT_USER", "AUDIT_PASS", "AUDITDB");
+    if (rc != AUDIT_SUCCESS) {
+        fprintf(stderr, "DB connect failed\n");
+        return 1;
+    }
+
+    if (argc < 2) {
+        printf("Usage: %s <command> [args...]\n", argv[0]);
+        printf("  search <from> <to> [event_type] [user_id]  - Search audit logs\n");
+        printf("  stat   <from> <to>                         - Audit statistics\n");
+        printf("  export <from> <to> <format> <output_file>  - Export (csv/xml)\n");
+        printf("  purge  <before_date>                       - Purge old logs\n");
+        audit_db_disconnect();
+        return 0;
+    }
+
+    if (strcmp(argv[1], "search") == 0 && argc >= 4) {
+        memset(&search, 0, sizeof(search));
+        AUD_STRCPY(search.from_date, argv[2], sizeof(search.from_date));
+        AUD_STRCPY(search.to_date, argv[3], sizeof(search.to_date));
+        if (argc >= 5) AUD_STRCPY(search.event_type, argv[4], sizeof(search.event_type));
+        if (argc >= 6) AUD_STRCPY(search.user_id, argv[5], sizeof(search.user_id));
+        search.limit = 100;
+
+        rc = audit_search(&search, records, &cnt);
+        if (rc == AUDIT_SUCCESS) {
+            printf("Found %d audit records (%s ~ %s)\n", cnt, search.from_date, search.to_date);
+            for (int i = 0; i < cnt; i++) {
+                print_audit_record(&records[i]);
+            }
+        }
+
+    } else if (strcmp(argv[1], "stat") == 0 && argc >= 4) {
+        rc = audit_get_stat(argv[2], argv[3], stats, &cnt);
+        if (rc == AUDIT_SUCCESS) {
+            printf("%-12s %-5s %8s %8s %8s %6s %6s\n", "Date", "Type", "Total", "Success", "Fail", "Users", "IPs");
+            printf("%-12s %-5s %8s %8s %8s %6s %6s\n", "----", "----", "-----", "-------", "----", "-----", "---");
+            for (int i = 0; i < cnt; i++) {
+                printf("%-12s %-5s %8d %8d %8d %6d %6d\n",
+                       stats[i].date, stats[i].event_type,
+                       stats[i].total_cnt, stats[i].success_cnt, stats[i].fail_cnt,
+                       stats[i].unique_users, stats[i].unique_ips);
+            }
+        }
+
+    } else if (strcmp(argv[1], "export") == 0 && argc >= 6) {
+        /* 먼저 검색 */
+        memset(&search, 0, sizeof(search));
+        AUD_STRCPY(search.from_date, argv[2], sizeof(search.from_date));
+        AUD_STRCPY(search.to_date, argv[3], sizeof(search.to_date));
+
+        rc = audit_search(&search, records, &cnt);
+        if (rc == AUDIT_SUCCESS && cnt > 0) {
+            memset(&exp_opt, 0, sizeof(exp_opt));
+            if (strcmp(argv[4], "csv") == 0) exp_opt.format = EXPORT_CSV;
+            else if (strcmp(argv[4], "xml") == 0) exp_opt.format = EXPORT_XML;
+            else exp_opt.format = EXPORT_FIXED;
+            AUD_STRCPY(exp_opt.output_path, argv[5], sizeof(exp_opt.output_path));
+            exp_opt.include_header = 1;
+
+            rc = audit_export(&exp_opt, records, cnt);
+            printf("Export %s: %d records -> %s (rc=%d)\n", argv[4], cnt, argv[5], rc);
+        }
+
+    } else if (strcmp(argv[1], "purge") == 0 && argc >= 3) {
+        rc = audit_purge(argv[2], &cnt);
+        printf("Purge result: %d records deleted (rc=%d)\n", cnt, rc);
+
+    } else {
+        printf("Unknown command: %s\n", argv[1]);
+    }
+
+    audit_db_disconnect();
+    return 0;
+}

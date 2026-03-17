@@ -1,0 +1,567 @@
+/*******************************************************************************
+ * loan_approve.pc - 대출 심사 규칙 엔진
+ *
+ * 작성일: 2009-11-10
+ * 수정일: 2014-03-20  최차장 - 담보 심사 규칙 추가
+ * 수정일: 2017-09-15  김대리 - DSR/LTV 규칙 추가
+ * 수정일: 2020-06-01  박과장 - 동적SQL 규칙 조회 (PREPARE/EXECUTE)
+ * 수정일: 2022-11-30  이사원 - nested cursor 심사 로직
+ *
+ * 대출 심사 규칙 엔진
+ * - 규칙 DB 조회 (동적 SQL)
+ * - 다중 규칙 평가
+ * - 승인/거절/조건부 판정
+ ******************************************************************************/
+
+#include "loan_common.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    char    ha_loan_no[MAX_LOAN_NO];
+    char    ha_cust_no[MAX_CUST_NO];
+    char    ha_rule_code[5];
+    char    ha_rule_name[30];
+    char    ha_rule_sql[MAX_SQL_LEN];
+    double  ha_threshold;
+    char    ha_compare_type[3];     /* GT, LT, EQ, GE, LE, NE */
+    char    ha_severity[2];         /* F:Fail R:Reject W:Warn */
+    double  ha_result_value;
+    int     ha_count;
+    char    ha_loan_type[3];
+    char    ha_prod_code[MAX_PROD_CODE];
+    double  ha_request_amt;
+    double  ha_approved_amt;
+    double  ha_income;
+    int     ha_credit_grade;
+    double  ha_credit_score;
+    int     ha_age;
+    int     ha_emp_months;
+    int     ha_overdue_cnt;
+    double  ha_exist_balance;
+    double  ha_collateral_value;
+    double  ha_monthly_repay;
+    /* 동적 SQL */
+    char    ha_dyn_sql[MAX_SQL_LEN];
+    double  ha_dyn_result;
+EXEC SQL END DECLARE SECTION;
+
+/* 전역 */
+static int g_rule_exec_count = 0;
+
+/* 2020-06-01 사용안함 - 하드코딩 규칙 */
+/*
+static int old_check_rules(LOAN_APPLICATION *app) {
+    if (app->credit.credit_grade > 7) return -1;
+    if (app->request_amt > app->credit.annual_income * 3) return -1;
+    return 0;
+}
+*/
+
+/*******************************************************************************
+ * eval_compare - 비교 연산 평가
+ ******************************************************************************/
+static int eval_compare(double actual, const char *compare_type, double threshold)
+{
+    if (strcmp(compare_type, "GT") == 0) return actual > threshold;
+    if (strcmp(compare_type, "GE") == 0) return actual >= threshold;
+    if (strcmp(compare_type, "LT") == 0) return actual < threshold;
+    if (strcmp(compare_type, "LE") == 0) return actual <= threshold;
+    if (strcmp(compare_type, "EQ") == 0) return (int)actual == (int)threshold;
+    if (strcmp(compare_type, "NE") == 0) return (int)actual != (int)threshold;
+    return 0;
+}
+
+/*******************************************************************************
+ * loan_dynamic_rule_query - 동적 SQL 규칙 실행
+ *
+ * 규칙 테이블에 저장된 SQL을 PREPARE/EXECUTE로 실행
+ * SQL은 :cust_no 바인드 변수를 포함하며 단일 숫자값 반환
+ *
+ * 예: SELECT COUNT(*) FROM TB_LOAN_OVERDUE_HIST WHERE CUST_NO = :cust_no AND OVERDUE_DAYS > 30
+ ******************************************************************************/
+int loan_dynamic_rule_query(const char *rule_code, const char *cust_no, double *result_value)
+{
+    LN_CHECK_NULL(rule_code);
+    LN_CHECK_NULL(cust_no);
+    LN_CHECK_NULL(result_value);
+
+    *result_value = 0;
+
+    LN_STRCPY(ha_rule_code, rule_code, sizeof(ha_rule_code));
+
+    /* 규칙 SQL 조회 */
+    EXEC SQL SELECT RULE_SQL
+        INTO :ha_dyn_sql
+        FROM TB_LOAN_RULE_MST
+        WHERE RULE_CODE = :ha_rule_code
+        AND   RULE_TYPE = 'SQL'
+        AND   USE_YN = 'Y';
+
+    if (sqlca.sqlcode == 1403) {
+        LN_DEBUG("No SQL rule found for %s", rule_code);
+        return LOAN_ERR_NOT_FOUND;
+    }
+    if (sqlca.sqlcode != 0) {
+        LN_ERROR("Rule SQL query failed: code=%s sqlcode=%ld", rule_code, sqlca.sqlcode);
+        return LOAN_ERR_SQL;
+    }
+
+    /* 동적 SQL 실행 */
+    LN_STRCPY(ha_cust_no, cust_no, sizeof(ha_cust_no));
+
+    EXEC SQL PREPARE dyn_stmt FROM :ha_dyn_sql;
+    if (sqlca.sqlcode != 0) {
+        LN_ERROR("PREPARE failed: rule=%s sqlcode=%ld sql=%s", rule_code, sqlca.sqlcode, ha_dyn_sql);
+        return LOAN_ERR_SQL;
+    }
+
+    EXEC SQL DECLARE dyn_cursor CURSOR FOR dyn_stmt;
+    EXEC SQL OPEN dyn_cursor USING :ha_cust_no;
+
+    if (sqlca.sqlcode != 0) {
+        LN_ERROR("Dynamic cursor open failed: rule=%s sqlcode=%ld", rule_code, sqlca.sqlcode);
+        return LOAN_ERR_SQL;
+    }
+
+    EXEC SQL FETCH dyn_cursor INTO :ha_dyn_result;
+    if (sqlca.sqlcode == 0) {
+        *result_value = ha_dyn_result;
+    } else if (sqlca.sqlcode == 1403) {
+        *result_value = 0;
+    } else {
+        EXEC SQL CLOSE dyn_cursor;
+        return LOAN_ERR_SQL;
+    }
+
+    EXEC SQL CLOSE dyn_cursor;
+
+    g_rule_exec_count++;
+    LN_DEBUG("Dynamic rule %s: result=%.2f (sql=%s)", rule_code, *result_value, ha_dyn_sql);
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * check_rule_income_ratio - 소득대비 상환비율 규칙 (R01)
+ ******************************************************************************/
+static int check_rule_income_ratio(LOAN_APPLICATION *app, RULE_RESULT *rule)
+{
+    double monthly_pmt;
+    double ratio;
+    double monthly_rate;
+
+    LN_STRCPY(rule->rule_code, RULE_INCOME_RATIO, sizeof(rule->rule_code));
+    LN_STRCPY(rule->rule_name, "소득대비상환비율", sizeof(rule->rule_name));
+    rule->threshold = 40.0;  /* 월소득의 40% */
+
+    /* 예상 월상환금 계산 (원리금균등 기준) */
+    if (app->interest_rate > 0 && app->loan_term_months > 0) {
+        monthly_rate = app->interest_rate / 100.0 / 12.0;
+        double pow_val = pow(1.0 + monthly_rate, (double)app->loan_term_months);
+        monthly_pmt = app->request_amt * monthly_rate * pow_val / (pow_val - 1.0);
+    } else {
+        monthly_pmt = app->request_amt / app->loan_term_months;
+    }
+
+    /* 기존 월상환 + 신규 월상환 */
+    double total_repay = app->credit.monthly_repayment + monthly_pmt;
+
+    if (app->credit.monthly_income > 0) {
+        ratio = (total_repay / app->credit.monthly_income) * 100.0;
+    } else {
+        ratio = 999.0;
+    }
+
+    rule->actual_value = ratio;
+    sprintf(rule->detail, "월소득=%.0f, 기존상환=%.0f, 신규상환=%.0f, 비율=%.1f%%",
+            app->credit.monthly_income, app->credit.monthly_repayment, monthly_pmt, ratio);
+
+    if (ratio <= rule->threshold) {
+        rule->pass_yn = 'Y';
+    } else if (ratio <= 50.0) {
+        rule->pass_yn = 'W';  /* 경고 */
+    } else {
+        rule->pass_yn = 'N';
+    }
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * check_rule_credit_grade - 신용등급 규칙 (R02)
+ ******************************************************************************/
+static int check_rule_credit_grade(LOAN_APPLICATION *app, RULE_RESULT *rule)
+{
+    int max_grade;
+
+    LN_STRCPY(rule->rule_code, RULE_CREDIT_GRADE, sizeof(rule->rule_code));
+    LN_STRCPY(rule->rule_name, "신용등급", sizeof(rule->rule_name));
+
+    /* 상품유형별 최대 허용등급 */
+    if (strcmp(app->loan_type, LOAN_TYPE_MORTGAGE) == 0) {
+        max_grade = 8;  /* 담보대출은 8등급까지 */
+    } else if (strcmp(app->loan_type, LOAN_TYPE_PERSONAL) == 0) {
+        max_grade = 6;  /* 신용대출은 6등급까지 */
+    } else if (strcmp(app->loan_type, LOAN_TYPE_AUTO) == 0) {
+        max_grade = 7;
+    } else {
+        max_grade = 5;  /* 사업자대출 */
+    }
+
+    rule->threshold = (double)max_grade;
+    rule->actual_value = (double)app->credit.credit_grade;
+    sprintf(rule->detail, "신용등급=%d, 허용최대=%d", app->credit.credit_grade, max_grade);
+
+    if (app->credit.credit_grade <= max_grade) {
+        rule->pass_yn = 'Y';
+    } else if (app->credit.credit_grade <= max_grade + 1) {
+        rule->pass_yn = 'W';
+    } else {
+        rule->pass_yn = 'N';
+    }
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * check_rule_age - 나이 제한 규칙 (R03)
+ ******************************************************************************/
+static int check_rule_age(LOAN_APPLICATION *app, RULE_RESULT *rule)
+{
+    int max_age_at_maturity;
+
+    LN_STRCPY(rule->rule_code, RULE_AGE_LIMIT, sizeof(rule->rule_code));
+    LN_STRCPY(rule->rule_name, "나이제한", sizeof(rule->rule_name));
+
+    /* 만기시 나이 = 현재나이 + 대출기간(년) */
+    max_age_at_maturity = app->credit.age + (app->loan_term_months / 12);
+    rule->threshold = 70.0;
+    rule->actual_value = (double)max_age_at_maturity;
+    sprintf(rule->detail, "현재나이=%d, 만기시=%d, 한도=70세", app->credit.age, max_age_at_maturity);
+
+    if (app->credit.age < 19) {
+        rule->pass_yn = 'N';
+        sprintf(rule->detail, "미성년자 (나이=%d)", app->credit.age);
+    } else if (max_age_at_maturity <= 70) {
+        rule->pass_yn = 'Y';
+    } else if (max_age_at_maturity <= 75) {
+        rule->pass_yn = 'W';
+    } else {
+        rule->pass_yn = 'N';
+    }
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * check_rule_overdue - 연체 이력 규칙 (R05)
+ ******************************************************************************/
+static int check_rule_overdue(LOAN_APPLICATION *app, RULE_RESULT *rule)
+{
+    LN_STRCPY(rule->rule_code, RULE_OVERDUE_HIST, sizeof(rule->rule_code));
+    LN_STRCPY(rule->rule_name, "연체이력", sizeof(rule->rule_name));
+
+    rule->threshold = 0;
+    rule->actual_value = (double)app->credit.overdue_cnt_1y;
+
+    if (app->credit.max_overdue_days > 90) {
+        rule->pass_yn = 'N';
+        sprintf(rule->detail, "장기연체 이력: 최장 %ld일", app->credit.max_overdue_days);
+    } else if (app->credit.overdue_cnt_1y >= 3) {
+        rule->pass_yn = 'N';
+        sprintf(rule->detail, "최근1년 연체 %d회 (3회 이상 거절)", app->credit.overdue_cnt_1y);
+    } else if (app->credit.overdue_cnt_1y >= 1) {
+        rule->pass_yn = 'W';
+        sprintf(rule->detail, "최근1년 연체 %d회 (주의)", app->credit.overdue_cnt_1y);
+    } else {
+        rule->pass_yn = 'Y';
+        sprintf(rule->detail, "연체이력 없음");
+    }
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * check_rule_blacklist - 블랙리스트 규칙 (R08)
+ ******************************************************************************/
+static int check_rule_blacklist(LOAN_APPLICATION *app, RULE_RESULT *rule)
+{
+    LN_STRCPY(rule->rule_code, RULE_BLACKLIST, sizeof(rule->rule_code));
+    LN_STRCPY(rule->rule_name, "블랙리스트", sizeof(rule->rule_name));
+
+    rule->threshold = 0;
+    rule->actual_value = (app->credit.blacklist_yn == 'Y') ? 1.0 : 0.0;
+
+    if (app->credit.blacklist_yn == 'Y') {
+        rule->pass_yn = 'N';
+        sprintf(rule->detail, "블랙리스트 등재 고객 - 즉시 거절");
+    } else {
+        rule->pass_yn = 'Y';
+        sprintf(rule->detail, "블랙리스트 해당 없음");
+    }
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * check_rule_dsr - 총부채상환비율 규칙 (R09, 2017-09-15 추가)
+ ******************************************************************************/
+static int check_rule_dsr(LOAN_APPLICATION *app, RULE_RESULT *rule)
+{
+    double dsr;
+    double new_monthly_pmt;
+    double monthly_rate;
+
+    LN_STRCPY(rule->rule_code, RULE_DEBT_RATIO, sizeof(rule->rule_code));
+    LN_STRCPY(rule->rule_name, "DSR(총부채상환)", sizeof(rule->rule_name));
+
+    /* 신규 대출 예상 월상환금 */
+    if (app->interest_rate > 0 && app->loan_term_months > 0) {
+        monthly_rate = app->interest_rate / 100.0 / 12.0;
+        double pow_val = pow(1.0 + monthly_rate, (double)app->loan_term_months);
+        new_monthly_pmt = app->request_amt * monthly_rate * pow_val / (pow_val - 1.0);
+    } else {
+        new_monthly_pmt = app->request_amt / 60.0;  /* 기본 5년 가정 */
+    }
+
+    dsr = loan_calc_dsr(app->credit.monthly_income,
+                        app->credit.monthly_repayment + new_monthly_pmt);
+
+    rule->threshold = 40.0;  /* DSR 40% 규제 */
+    rule->actual_value = dsr;
+    sprintf(rule->detail, "DSR=%.1f%% (한도 40%%), 월소득=%.0f, 총상환=%.0f",
+            dsr, app->credit.monthly_income, app->credit.monthly_repayment + new_monthly_pmt);
+
+    if (dsr <= 40.0) {
+        rule->pass_yn = 'Y';
+    } else if (dsr <= 50.0) {
+        rule->pass_yn = 'W';
+    } else {
+        rule->pass_yn = 'N';
+    }
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * check_rule_ltv - 담보인정비율 규칙 (R10, 2017-09-15 추가)
+ ******************************************************************************/
+static int check_rule_ltv(LOAN_APPLICATION *app, RULE_RESULT *rule)
+{
+    double ltv;
+    double max_ltv;
+
+    LN_STRCPY(rule->rule_code, RULE_LTV, sizeof(rule->rule_code));
+    LN_STRCPY(rule->rule_name, "LTV(담보비율)", sizeof(rule->rule_name));
+
+    /* 비담보대출은 SKIP */
+    if (app->total_collateral_value <= 0) {
+        rule->pass_yn = 'Y';
+        sprintf(rule->detail, "비담보대출 - LTV 해당없음");
+        return LOAN_SUCCESS;
+    }
+
+    ltv = loan_calc_ltv(app->request_amt, app->total_collateral_value);
+
+    /* 지역/상품별 LTV 한도 (간이 - 실제로는 DB 조회) */
+    if (strcmp(app->loan_type, LOAN_TYPE_MORTGAGE) == 0) {
+        max_ltv = 70.0;  /* 주택담보 70% */
+    } else {
+        max_ltv = 80.0;
+    }
+
+    rule->threshold = max_ltv;
+    rule->actual_value = ltv;
+    sprintf(rule->detail, "LTV=%.1f%% (한도 %.0f%%), 신청=%.0f, 담보=%.0f",
+            ltv, max_ltv, app->request_amt, app->total_collateral_value);
+
+    if (ltv <= max_ltv) {
+        rule->pass_yn = 'Y';
+    } else if (ltv <= max_ltv + 10.0) {
+        rule->pass_yn = 'W';
+    } else {
+        rule->pass_yn = 'N';
+    }
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * loan_execute_rules - 규칙 실행 (DB 기반 동적 규칙 포함)
+ *
+ * nested cursor: 규칙 마스터 -> 규칙별 상세 조건 -> 동적SQL 실행
+ ******************************************************************************/
+int loan_execute_rules(LOAN_APPLICATION *app, RULE_RESULT *rules, int *cnt)
+{
+    int idx = 0;
+    int rc;
+
+    LN_CHECK_NULL(app);
+    LN_CHECK_NULL(rules);
+    LN_CHECK_NULL(cnt);
+
+    /* 1. 하드코딩 규칙 실행 */
+    check_rule_blacklist(app, &rules[idx++]);
+    check_rule_credit_grade(app, &rules[idx++]);
+    check_rule_age(app, &rules[idx++]);
+    check_rule_overdue(app, &rules[idx++]);
+    check_rule_income_ratio(app, &rules[idx++]);
+    check_rule_dsr(app, &rules[idx++]);
+    check_rule_ltv(app, &rules[idx++]);
+
+    /* 2. DB 기반 동적 규칙 실행 (2020-06-01 추가) */
+    LN_STRCPY(ha_loan_type, app->loan_type, sizeof(ha_loan_type));
+
+    EXEC SQL DECLARE cur_rules CURSOR FOR
+        SELECT R.RULE_CODE, R.RULE_NAME, R.THRESHOLD, R.COMPARE_TYPE, R.SEVERITY
+        FROM   TB_LOAN_RULE_MST R
+        WHERE  R.USE_YN = 'Y'
+        AND    R.RULE_TYPE = 'SQL'
+        AND    (R.LOAN_TYPE IS NULL OR R.LOAN_TYPE = :ha_loan_type)
+        ORDER BY R.RULE_ORDER;
+
+    EXEC SQL OPEN cur_rules;
+    if (sqlca.sqlcode != 0) {
+        LN_WARN("Dynamic rules cursor open failed: sqlcode=%ld", sqlca.sqlcode);
+        *cnt = idx;
+        return LOAN_SUCCESS;  /* 동적 규칙 실패해도 계속 */
+    }
+
+    while (idx < MAX_RULE_CNT) {
+        EXEC SQL FETCH cur_rules
+            INTO :ha_rule_code, :ha_rule_name, :ha_threshold, :ha_compare_type, :ha_severity;
+
+        if (sqlca.sqlcode == 1403) break;
+        if (sqlca.sqlcode != 0) break;
+
+        /* 동적 SQL 실행 */
+        rc = loan_dynamic_rule_query(ha_rule_code, app->cust_no, &ha_result_value);
+        if (rc != LOAN_SUCCESS) {
+            LN_WARN("Dynamic rule %s execution failed: rc=%d", ha_rule_code, rc);
+            continue;
+        }
+
+        /* 결과 평가 */
+        LN_STRCPY(rules[idx].rule_code, ha_rule_code, sizeof(rules[idx].rule_code));
+        LN_STRCPY(rules[idx].rule_name, ha_rule_name, sizeof(rules[idx].rule_name));
+        rules[idx].threshold = ha_threshold;
+        rules[idx].actual_value = ha_result_value;
+
+        int passed = eval_compare(ha_result_value, ha_compare_type, ha_threshold);
+
+        if (passed) {
+            rules[idx].pass_yn = 'Y';
+        } else {
+            rules[idx].pass_yn = (ha_severity[0] == 'W') ? 'W' : 'N';
+        }
+
+        sprintf(rules[idx].detail, "동적규칙 %s: actual=%.2f %s %.2f -> %s",
+                ha_rule_code, ha_result_value, ha_compare_type, ha_threshold,
+                rules[idx].pass_yn == 'Y' ? "PASS" : (rules[idx].pass_yn == 'W' ? "WARN" : "FAIL"));
+
+        idx++;
+    }
+
+    EXEC SQL CLOSE cur_rules;
+
+    *cnt = idx;
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * loan_approve_check - 심사 종합 판정
+ *
+ * 전체 규칙 실행 후 승인/거절/조건부 판정
+ * - 하나라도 N(Fail)이면 거절
+ * - 경고만 있으면 조건부 승인
+ * - 전체 통과시 승인
+ ******************************************************************************/
+int loan_approve_check(LOAN_APPLICATION *app, APPROVAL_RESULT *result)
+{
+    int rc;
+    int i;
+
+    LN_CHECK_NULL(app);
+    LN_CHECK_NULL(result);
+    memset(result, 0, sizeof(APPROVAL_RESULT));
+
+    LN_INFO("=== Approval check started: loan=%s cust=%s ===", app->loan_no, app->cust_no);
+
+    /* 금리 계산 */
+    double calc_rate;
+    rc = loan_calc_rate(app, &calc_rate);
+    if (rc == LOAN_SUCCESS && app->interest_rate <= 0) {
+        app->interest_rate = calc_rate;
+    }
+
+    /* 규칙 실행 */
+    rc = loan_execute_rules(app, result->rules, &result->rule_cnt);
+    if (rc != LOAN_SUCCESS) {
+        LN_ERROR("Rule execution failed: rc=%d", rc);
+        result->decision = 'R';
+        sprintf(result->reason, "규칙 실행 오류 (rc=%d)", rc);
+        return LOAN_ERR_RULE;
+    }
+
+    /* 판정 집계 */
+    result->pass_cnt = 0;
+    result->fail_cnt = 0;
+    result->warn_cnt = 0;
+
+    for (i = 0; i < result->rule_cnt; i++) {
+        switch (result->rules[i].pass_yn) {
+            case 'Y': result->pass_cnt++; break;
+            case 'N': result->fail_cnt++; break;
+            case 'W': result->warn_cnt++; break;
+        }
+
+        LN_INFO("  Rule [%s] %s: %c - %s",
+                result->rules[i].rule_code, result->rules[i].rule_name,
+                result->rules[i].pass_yn, result->rules[i].detail);
+    }
+
+    /* 최종 판정 */
+    if (result->fail_cnt > 0) {
+        result->decision = 'R';  /* 거절 */
+        result->approved_amt = 0;
+        result->approved_rate = 0;
+
+        /* 거절 사유 수집 */
+        char reason_buf[MAX_NOTE] = "";
+        for (i = 0; i < result->rule_cnt; i++) {
+            if (result->rules[i].pass_yn == 'N') {
+                char tmp[100];
+                sprintf(tmp, "[%s]%s ", result->rules[i].rule_code, result->rules[i].rule_name);
+                if (strlen(reason_buf) + strlen(tmp) < MAX_NOTE - 1) {
+                    strcat(reason_buf, tmp);
+                }
+            }
+        }
+        sprintf(result->reason, "심사 거절: %s", reason_buf);
+
+    } else if (result->warn_cnt > 0) {
+        result->decision = 'C';  /* 조건부 승인 */
+        /* 경고 항목에 따라 금액 조정 */
+        double adjust_ratio = 1.0 - (result->warn_cnt * 0.10);  /* 경고 1건당 10% 감액 */
+        if (adjust_ratio < 0.5) adjust_ratio = 0.5;
+
+        result->approved_amt = ROUND_10(app->request_amt * adjust_ratio);
+        result->approved_rate = calc_rate;
+        result->approved_term = app->loan_term_months;
+        sprintf(result->reason, "조건부 승인: 경고 %d건, 감액비율 %.0f%%", result->warn_cnt, adjust_ratio * 100);
+
+    } else {
+        result->decision = 'A';  /* 승인 */
+        result->approved_amt = app->request_amt;
+        result->approved_rate = calc_rate;
+        result->approved_term = app->loan_term_months;
+        sprintf(result->reason, "심사 통과: %d건 규칙 모두 충족", result->pass_cnt);
+    }
+
+    LN_INFO("=== Approval result: %c (pass=%d fail=%d warn=%d) amt=%.0f rate=%.2f%% ===",
+            result->decision, result->pass_cnt, result->fail_cnt, result->warn_cnt,
+            result->approved_amt, result->approved_rate);
+
+    return LOAN_SUCCESS;
+}

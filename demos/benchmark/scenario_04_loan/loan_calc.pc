@@ -1,0 +1,445 @@
+/*******************************************************************************
+ * loan_calc.pc - 대출 금리/상환 계산 모듈
+ *
+ * 작성일: 2009-11-10
+ * 수정일: 2014-03-20  최차장 - 담보대출 금리 산출
+ * 수정일: 2017-09-15  김대리 - DSR/LTV 계산 추가
+ * 수정일: 2020-06-01  박과장 - 거치기간 상환 스케줄
+ * 수정일: 2022-11-30  이사원 - 변동금리 스프레드 조회
+ *
+ * 원리금균등/원금균등/만기일시 상환 스케줄 생성
+ * 금리 산출, DSR/LTV 비율 계산
+ ******************************************************************************/
+
+#include "loan_common.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    char    hlc_prod_code[MAX_PROD_CODE];
+    char    hlc_loan_type[3];
+    int     hlc_credit_grade;
+    double  hlc_base_rate;
+    double  hlc_spread;
+    double  hlc_adjust_rate;
+    int     hlc_loan_term;
+    char    hlc_rate_type[2];
+    double  hlc_min_rate;
+    double  hlc_max_rate;
+    int     hlc_count;
+EXEC SQL END DECLARE SECTION;
+
+/* 전역 - 기준금리 (2022-11-30) */
+static double g_base_rate = 3.50;  /* 한국은행 기준금리 */
+
+/* 2017 사용안함 - 예전 고정금리 테이블 */
+/*
+static double g_old_rate_table[] = {
+    3.5, 3.8, 4.2, 4.8, 5.5, 6.5, 7.8, 9.5, 12.0, 15.0
+};
+*/
+
+/*******************************************************************************
+ * get_credit_spread - 신용등급별 스프레드 조회
+ *
+ * DB에서 상품/등급별 스프레드 조회
+ * 없으면 기본 스프레드 테이블 사용
+ ******************************************************************************/
+static double get_credit_spread(const char *prod_code, int credit_grade)
+{
+    /* 기본 스프레드 (등급별) */
+    static double default_spread[] = {
+        0.0,   /* 0 - unused */
+        0.50,  /* 1등급 */
+        0.80,  /* 2등급 */
+        1.20,  /* 3등급 */
+        1.80,  /* 4등급 */
+        2.50,  /* 5등급 */
+        3.50,  /* 6등급 */
+        5.00,  /* 7등급 */
+        7.00,  /* 8등급 */
+        10.00, /* 9등급 */
+        15.00  /* 10등급 */
+    };
+
+    if (prod_code != NULL && prod_code[0] != '\0') {
+        LN_STRCPY(hlc_prod_code, prod_code, sizeof(hlc_prod_code));
+        hlc_credit_grade = credit_grade;
+
+        EXEC SQL SELECT NVL(SPREAD_RATE, 0)
+            INTO :hlc_spread
+            FROM TB_LOAN_RATE_MST
+            WHERE PROD_CODE = :hlc_prod_code
+            AND   CREDIT_GRADE = :hlc_credit_grade
+            AND   USE_YN = 'Y'
+            AND   ROWNUM = 1;
+
+        if (sqlca.sqlcode == 0 && hlc_spread > 0) {
+            return hlc_spread;
+        }
+    }
+
+    /* DB 조회 실패시 기본값 */
+    if (credit_grade < 1) credit_grade = 1;
+    if (credit_grade > 10) credit_grade = 10;
+    return default_spread[credit_grade];
+}
+
+/*******************************************************************************
+ * get_collateral_discount - 담보 할인율
+ ******************************************************************************/
+static double get_collateral_discount(const char *loan_type, double ltv)
+{
+    double discount = 0.0;
+
+    if (strcmp(loan_type, LOAN_TYPE_MORTGAGE) == 0) {
+        /* 주택담보: LTV에 따른 금리 할인 */
+        if (ltv <= 0.40) discount = 1.50;       /* LTV 40% 이하 */
+        else if (ltv <= 0.50) discount = 1.20;
+        else if (ltv <= 0.60) discount = 0.80;
+        else if (ltv <= 0.70) discount = 0.50;
+        else discount = 0.20;
+    } else if (strcmp(loan_type, LOAN_TYPE_AUTO) == 0) {
+        /* 자동차: 고정 할인 */
+        discount = 0.50;
+    }
+
+    return discount;
+}
+
+/*******************************************************************************
+ * loan_calc_rate - 적용 금리 산출
+ *
+ * 적용금리 = 기준금리 + 신용스프레드 - 담보할인 + 기간가산
+ ******************************************************************************/
+int loan_calc_rate(const LOAN_APPLICATION *app, double *rate)
+{
+    double spread, coll_discount, term_adjust;
+    double final_rate;
+
+    LN_CHECK_NULL(app);
+    LN_CHECK_NULL(rate);
+
+    /* 신용 스프레드 */
+    spread = get_credit_spread(app->prod_code, app->credit.credit_grade);
+
+    /* 담보 할인 */
+    coll_discount = 0;
+    if (app->total_collateral_value > 0 && app->request_amt > 0) {
+        double ltv = app->request_amt / app->total_collateral_value;
+        coll_discount = get_collateral_discount(app->loan_type, ltv);
+    }
+
+    /* 기간 가산 */
+    if (app->loan_term_months <= 12) term_adjust = 0.0;
+    else if (app->loan_term_months <= 36) term_adjust = 0.20;
+    else if (app->loan_term_months <= 60) term_adjust = 0.40;
+    else if (app->loan_term_months <= 120) term_adjust = 0.60;
+    else if (app->loan_term_months <= 240) term_adjust = 0.80;
+    else term_adjust = 1.00;
+
+    /* 최종 금리 */
+    final_rate = g_base_rate + spread - coll_discount + term_adjust;
+
+    /* 금리 범위 체크 */
+    /* DB에서 상품별 최소/최대 금리 조회 */
+    LN_STRCPY(hlc_prod_code, app->prod_code, sizeof(hlc_prod_code));
+    EXEC SQL SELECT NVL(MIN_RATE, 1.0), NVL(MAX_RATE, 25.0)
+        INTO :hlc_min_rate, :hlc_max_rate
+        FROM TB_LOAN_PRODUCT
+        WHERE PROD_CODE = :hlc_prod_code;
+
+    if (sqlca.sqlcode == 0) {
+        if (final_rate < hlc_min_rate) final_rate = hlc_min_rate;
+        if (final_rate > hlc_max_rate) final_rate = hlc_max_rate;
+    } else {
+        /* 상품 조회 실패시 기본 범위 */
+        if (final_rate < 1.0) final_rate = 1.0;
+        if (final_rate > 25.0) final_rate = 25.0;
+    }
+
+    /* 소수점 2자리 반올림 */
+    *rate = ((int)(final_rate * 100 + 0.5)) / 100.0;
+
+    LN_INFO("Rate calc: base=%.2f spread=%.2f coll_disc=%.2f term=%.2f -> final=%.2f%%",
+            g_base_rate, spread, coll_discount, term_adjust, *rate);
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * loan_calc_schedule_equal_pmt - 원리금균등 상환 스케줄
+ *
+ * 매월 동일한 금액(원금+이자) 납부
+ * 월상환금 = P * r * (1+r)^n / ((1+r)^n - 1)
+ * 거치기간: 이자만 납부 (2020-06-01 추가)
+ ******************************************************************************/
+int loan_calc_schedule_equal_pmt(double principal, double annual_rate, int months,
+                                 int grace, REPAY_SCHEDULE *schedule, int *cnt)
+{
+    double monthly_rate;
+    double pmt;
+    double balance;
+    double interest, princ;
+    int i;
+    int repay_months;
+    time_t now;
+    struct tm due_tm;
+
+    LN_CHECK_NULL(schedule);
+    LN_CHECK_NULL(cnt);
+
+    if (principal <= 0 || annual_rate <= 0 || months <= 0) {
+        return LOAN_ERR_INVALID;
+    }
+
+    monthly_rate = annual_rate / 100.0 / 12.0;
+    balance = principal;
+    repay_months = months - grace;
+
+    if (repay_months <= 0) {
+        /* 전체 거치 (만기일시 상환) */
+        return loan_calc_schedule_bullet(principal, annual_rate, months, schedule, cnt);
+    }
+
+    /* 원리금균등 월상환금 (거치기간 제외) */
+    double pow_val = pow(1.0 + monthly_rate, (double)repay_months);
+    pmt = principal * monthly_rate * pow_val / (pow_val - 1.0);
+    pmt = ROUND_1(pmt);
+
+    /* 기준일 (오늘 기준 매월 동일일자) */
+    now = time(NULL);
+    memcpy(&due_tm, localtime(&now), sizeof(struct tm));
+
+    *cnt = 0;
+    for (i = 0; i < months && *cnt < MAX_SCHEDULE_CNT; i++) {
+        REPAY_SCHEDULE *s = &schedule[*cnt];
+        memset(s, 0, sizeof(REPAY_SCHEDULE));
+
+        /* 납부일자 계산 */
+        due_tm.tm_mon += 1;
+        if (due_tm.tm_mon > 11) { due_tm.tm_mon = 0; due_tm.tm_year++; }
+        mktime(&due_tm);  /* 정규화 */
+
+        s->seq = i + 1;
+        snprintf(s->due_date, sizeof(s->due_date), "%04d-%02d-%02d",
+                 due_tm.tm_year + 1900, due_tm.tm_mon + 1, due_tm.tm_mday);
+
+        interest = ROUND_1(balance * monthly_rate);
+
+        if (i < grace) {
+            /* 거치기간: 이자만 */
+            s->interest = interest;
+            s->principal = 0;
+            s->payment = interest;
+        } else if (i == months - 1) {
+            /* 마지막 회차: 잔액 정리 */
+            s->interest = interest;
+            s->principal = balance;
+            s->payment = balance + interest;
+        } else {
+            /* 정상 상환 */
+            s->payment = pmt;
+            s->interest = interest;
+            s->principal = pmt - interest;
+            if (s->principal < 0) s->principal = 0;
+        }
+
+        balance -= s->principal;
+        if (balance < 0) balance = 0;
+        s->balance = ROUND_1(balance);
+        s->paid_yn = 'N';
+
+        (*cnt)++;
+    }
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * loan_calc_schedule_equal_princ - 원금균등 상환 스케줄
+ *
+ * 매월 동일한 원금 + 잔액 기반 이자
+ ******************************************************************************/
+int loan_calc_schedule_equal_princ(double principal, double annual_rate, int months,
+                                   int grace, REPAY_SCHEDULE *schedule, int *cnt)
+{
+    double monthly_rate;
+    double monthly_princ;
+    double balance;
+    double interest;
+    int i, repay_months;
+    time_t now;
+    struct tm due_tm;
+
+    LN_CHECK_NULL(schedule);
+    LN_CHECK_NULL(cnt);
+
+    if (principal <= 0 || annual_rate <= 0 || months <= 0) return LOAN_ERR_INVALID;
+
+    monthly_rate = annual_rate / 100.0 / 12.0;
+    repay_months = months - grace;
+    if (repay_months <= 0) {
+        return loan_calc_schedule_bullet(principal, annual_rate, months, schedule, cnt);
+    }
+
+    monthly_princ = ROUND_1(principal / repay_months);
+    balance = principal;
+
+    now = time(NULL);
+    memcpy(&due_tm, localtime(&now), sizeof(struct tm));
+
+    *cnt = 0;
+    for (i = 0; i < months && *cnt < MAX_SCHEDULE_CNT; i++) {
+        REPAY_SCHEDULE *s = &schedule[*cnt];
+        memset(s, 0, sizeof(REPAY_SCHEDULE));
+
+        due_tm.tm_mon += 1;
+        mktime(&due_tm);
+
+        s->seq = i + 1;
+        snprintf(s->due_date, sizeof(s->due_date), "%04d-%02d-%02d",
+                 due_tm.tm_year + 1900, due_tm.tm_mon + 1, due_tm.tm_mday);
+
+        interest = ROUND_1(balance * monthly_rate);
+
+        if (i < grace) {
+            s->interest = interest;
+            s->principal = 0;
+            s->payment = interest;
+        } else if (i == months - 1) {
+            s->principal = balance;
+            s->interest = interest;
+            s->payment = balance + interest;
+        } else {
+            s->principal = monthly_princ;
+            s->interest = interest;
+            s->payment = monthly_princ + interest;
+        }
+
+        balance -= s->principal;
+        if (balance < 0) balance = 0;
+        s->balance = ROUND_1(balance);
+        s->paid_yn = 'N';
+
+        (*cnt)++;
+    }
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * loan_calc_schedule_bullet - 만기일시 상환 스케줄
+ *
+ * 매월 이자만 납부, 만기에 원금 일시상환
+ ******************************************************************************/
+int loan_calc_schedule_bullet(double principal, double annual_rate, int months,
+                              REPAY_SCHEDULE *schedule, int *cnt)
+{
+    double monthly_rate;
+    double interest;
+    int i;
+    time_t now;
+    struct tm due_tm;
+
+    LN_CHECK_NULL(schedule);
+    LN_CHECK_NULL(cnt);
+
+    if (principal <= 0 || annual_rate <= 0 || months <= 0) return LOAN_ERR_INVALID;
+
+    monthly_rate = annual_rate / 100.0 / 12.0;
+    interest = ROUND_1(principal * monthly_rate);
+
+    now = time(NULL);
+    memcpy(&due_tm, localtime(&now), sizeof(struct tm));
+
+    *cnt = 0;
+    for (i = 0; i < months && *cnt < MAX_SCHEDULE_CNT; i++) {
+        REPAY_SCHEDULE *s = &schedule[*cnt];
+        memset(s, 0, sizeof(REPAY_SCHEDULE));
+
+        due_tm.tm_mon += 1;
+        mktime(&due_tm);
+
+        s->seq = i + 1;
+        snprintf(s->due_date, sizeof(s->due_date), "%04d-%02d-%02d",
+                 due_tm.tm_year + 1900, due_tm.tm_mon + 1, due_tm.tm_mday);
+
+        s->interest = interest;
+
+        if (i == months - 1) {
+            /* 만기: 원금 + 이자 */
+            s->principal = principal;
+            s->payment = principal + interest;
+            s->balance = 0;
+        } else {
+            s->principal = 0;
+            s->payment = interest;
+            s->balance = principal;
+        }
+
+        s->paid_yn = 'N';
+        (*cnt)++;
+    }
+
+    return LOAN_SUCCESS;
+}
+
+/*******************************************************************************
+ * loan_calc_schedule - 상환 스케줄 생성 (디스패치)
+ ******************************************************************************/
+int loan_calc_schedule(const LOAN_APPLICATION *app, REPAY_SCHEDULE *schedule, int *cnt)
+{
+    double rate;
+    double amt;
+    int rc;
+
+    LN_CHECK_NULL(app);
+    LN_CHECK_NULL(schedule);
+    LN_CHECK_NULL(cnt);
+
+    /* 금리 결정 */
+    if (app->interest_rate > 0) {
+        rate = app->interest_rate;
+    } else {
+        rc = loan_calc_rate(app, &rate);
+        if (rc != LOAN_SUCCESS) return rc;
+    }
+
+    /* 금액 결정 */
+    amt = (app->approved_amt > 0) ? app->approved_amt : app->request_amt;
+
+    LN_INFO("Generating schedule: amt=%.0f rate=%.2f%% term=%d grace=%d type=%c",
+            amt, rate, app->loan_term_months, app->grace_months, app->repay_type);
+
+    switch (app->repay_type) {
+        case REPAY_EQUAL_PMT:
+            return loan_calc_schedule_equal_pmt(amt, rate, app->loan_term_months, app->grace_months, schedule, cnt);
+        case REPAY_EQUAL_PRINC:
+            return loan_calc_schedule_equal_princ(amt, rate, app->loan_term_months, app->grace_months, schedule, cnt);
+        case REPAY_BULLET:
+        case REPAY_INTEREST_ONLY:
+            return loan_calc_schedule_bullet(amt, rate, app->loan_term_months, schedule, cnt);
+        default:
+            LN_ERROR("Unknown repay type: %c", app->repay_type);
+            return LOAN_ERR_INVALID;
+    }
+}
+
+/*******************************************************************************
+ * loan_calc_dsr - 총부채상환비율 계산
+ ******************************************************************************/
+double loan_calc_dsr(double monthly_income, double monthly_repay_total)
+{
+    if (monthly_income <= 0) return 999.99;
+    return (monthly_repay_total / monthly_income) * 100.0;
+}
+
+/*******************************************************************************
+ * loan_calc_ltv - 담보인정비율 계산
+ ******************************************************************************/
+double loan_calc_ltv(double loan_amt, double collateral_value)
+{
+    if (collateral_value <= 0) return 999.99;
+    return (loan_amt / collateral_value) * 100.0;
+}
