@@ -1,0 +1,377 @@
+/*******************************************************************************
+ * pay_detail.pc - 급여 상세 처리 모듈
+ *
+ * 작성일: 2006-05-20
+ * 수정일: 2013-01-10  최과장 - 시간외수당 로직 변경
+ * 수정일: 2018-11-20  김대리 - 급여명세서 포맷 개선
+ * 수정일: 2020-07-01  박사원 - 수당/공제 항목 확장
+ * 수정일: 2023-03-15  이대리 - 근태 연동 시간외수당
+ *
+ * 수당/공제 로드, 시간외수당 계산, 급여명세서 생성
+ * 여러 테이블 JOIN으로 데이터 조합
+ ******************************************************************************/
+
+#include "pay_common.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    char    hd_emp_no[MAX_EMP_NO];
+    char    hd_pay_ym[MAX_YYYYMM];
+    char    hd_item_code[5];
+    char    hd_item_name[30];
+    double  hd_amount;
+    char    hd_tax_yn[2];
+    double  hd_overtime_hours;
+    double  hd_night_hours;
+    double  hd_holiday_hours;
+    double  hd_base_salary;
+    double  hd_gross_pay;
+    double  hd_total_deduct;
+    double  hd_net_pay;
+    char    hd_status[2];
+    char    hd_calc_date[MAX_DATE_LEN];
+    char    hd_pay_date[MAX_DATE_LEN];
+    char    hd_note[MAX_NOTE];
+    int     hd_seq;
+    int     hd_count;
+EXEC SQL END DECLARE SECTION;
+
+/* 2013-01-10 사용안함 - 예전 시간외수당 고정값 */
+/* static double g_old_overtime_fixed = 200000; */
+/* static double g_old_night_fixed = 100000; */
+
+/*******************************************************************************
+ * pay_load_allowances - 수당 항목 로드
+ *
+ * TB_PAY_ALLOWANCE 테이블에서 해당 사원/급여년월 수당 조회
+ * 수당이 없는 경우 PAY_ERR_NOT_FOUND 반환 (pay_main에서 기본급 설정)
+ ******************************************************************************/
+int pay_load_allowances(const char *emp_no, const char *pay_ym,
+                        PAY_ITEM *items, int *cnt, double *total)
+{
+    int idx = 0;
+    double sum = 0.0;
+
+    PAY_CHECK_NULL(emp_no);
+    PAY_CHECK_NULL(pay_ym);
+    PAY_CHECK_NULL(items);
+    PAY_CHECK_NULL(cnt);
+    PAY_CHECK_NULL(total);
+
+    PAY_STRCPY(hd_emp_no, emp_no, sizeof(hd_emp_no));
+    PAY_STRCPY(hd_pay_ym, pay_ym, sizeof(hd_pay_ym));
+
+    /* 수당 테이블 + 항목 마스터 조인 */
+    EXEC SQL DECLARE cur_allow CURSOR FOR
+        SELECT A.ITEM_CODE, M.ITEM_NAME, A.AMOUNT, M.TAX_YN
+        FROM   TB_PAY_ALLOWANCE A
+        INNER JOIN TB_PAY_ITEM_MST M ON A.ITEM_CODE = M.ITEM_CODE
+        WHERE  A.EMP_NO = :hd_emp_no
+        AND    A.PAY_YM = :hd_pay_ym
+        AND    A.AMOUNT > 0
+        ORDER BY A.ITEM_CODE;
+
+    EXEC SQL OPEN cur_allow;
+    if (sqlca.sqlcode != 0) {
+        PAY_LOG_ERROR("Open allowance cursor failed: sqlcode=%ld", sqlca.sqlcode);
+        return PAY_ERR_DB;
+    }
+
+    while (idx < MAX_ALLOW_CNT) {
+        EXEC SQL FETCH cur_allow
+            INTO :hd_item_code, :hd_item_name, :hd_amount, :hd_tax_yn;
+
+        if (sqlca.sqlcode == 1403) break;
+        if (sqlca.sqlcode != 0) {
+            EXEC SQL CLOSE cur_allow;
+            return PAY_ERR_DB;
+        }
+
+        PAY_STRCPY(items[idx].item_code, hd_item_code, sizeof(items[idx].item_code));
+        PAY_STRCPY(items[idx].item_name, hd_item_name, sizeof(items[idx].item_name));
+        items[idx].amount = hd_amount;
+        items[idx].tax_yn = hd_tax_yn[0];
+        sum += hd_amount;
+        idx++;
+    }
+
+    EXEC SQL CLOSE cur_allow;
+
+    *cnt = idx;
+    *total = sum;
+
+    if (idx == 0) return PAY_ERR_NOT_FOUND;
+    return PAY_SUCCESS;
+}
+
+/*******************************************************************************
+ * pay_load_deductions - 공제 항목 로드
+ *
+ * TB_PAY_DEDUCTION에서 기타공제 항목 조회
+ * (세금/4대보험은 pay_main에서 계산하므로 여기서는 기타공제만)
+ ******************************************************************************/
+int pay_load_deductions(const char *emp_no, const char *pay_ym,
+                        PAY_ITEM *items, int *cnt, double *total)
+{
+    int idx = 0;
+    double sum = 0.0;
+
+    PAY_CHECK_NULL(emp_no);
+    PAY_CHECK_NULL(pay_ym);
+    PAY_CHECK_NULL(items);
+    PAY_CHECK_NULL(cnt);
+    PAY_CHECK_NULL(total);
+
+    PAY_STRCPY(hd_emp_no, emp_no, sizeof(hd_emp_no));
+    PAY_STRCPY(hd_pay_ym, pay_ym, sizeof(hd_pay_ym));
+
+    EXEC SQL DECLARE cur_deduct CURSOR FOR
+        SELECT D.ITEM_CODE, M.ITEM_NAME, D.AMOUNT, 'Y'
+        FROM   TB_PAY_DEDUCTION D
+        INNER JOIN TB_PAY_ITEM_MST M ON D.ITEM_CODE = M.ITEM_CODE
+        WHERE  D.EMP_NO = :hd_emp_no
+        AND    D.PAY_YM = :hd_pay_ym
+        AND    D.ITEM_CODE NOT IN ('201','202','203','204','205','206')
+        AND    D.AMOUNT > 0
+        ORDER BY D.ITEM_CODE;
+
+    EXEC SQL OPEN cur_deduct;
+    if (sqlca.sqlcode != 0) return PAY_ERR_DB;
+
+    while (idx < MAX_DEDUCT_CNT) {
+        EXEC SQL FETCH cur_deduct
+            INTO :hd_item_code, :hd_item_name, :hd_amount, :hd_tax_yn;
+
+        if (sqlca.sqlcode == 1403) break;
+        if (sqlca.sqlcode != 0) { EXEC SQL CLOSE cur_deduct; return PAY_ERR_DB; }
+
+        PAY_STRCPY(items[idx].item_code, hd_item_code, sizeof(items[idx].item_code));
+        PAY_STRCPY(items[idx].item_name, hd_item_name, sizeof(items[idx].item_name));
+        items[idx].amount = hd_amount;
+        items[idx].tax_yn = 'Y';
+        sum += hd_amount;
+        idx++;
+    }
+
+    EXEC SQL CLOSE cur_deduct;
+
+    *cnt = idx;
+    *total = sum;
+    return PAY_SUCCESS;
+}
+
+/*******************************************************************************
+ * pay_calc_overtime - 시간외수당 계산
+ *
+ * TB_PAY_ATTENDANCE에서 근태 데이터 조회하여 수당 산출
+ * (2023-03-15 이대리 - 근태 연동으로 변경)
+ *
+ * 시간외: 통상시급 * 1.5 * 시간
+ * 야간:   통상시급 * 2.0 * 시간
+ * 휴일:   통상시급 * 2.0 * 시간
+ *
+ * 통상시급 = 기본급 / 209
+ ******************************************************************************/
+int pay_calc_overtime(const char *emp_no, const char *pay_ym,
+                      double base_salary,
+                      double *overtime, double *night, double *holiday)
+{
+    double hourly_rate;
+
+    PAY_CHECK_NULL(emp_no);
+    PAY_CHECK_NULL(overtime);
+    PAY_CHECK_NULL(night);
+    PAY_CHECK_NULL(holiday);
+
+    *overtime = 0;
+    *night = 0;
+    *holiday = 0;
+
+    if (base_salary <= 0) return PAY_SUCCESS;
+
+    /* 통상시급 */
+    hourly_rate = base_salary / (double)WORK_HOURS_PER_MONTH;
+
+    PAY_STRCPY(hd_emp_no, emp_no, sizeof(hd_emp_no));
+    PAY_STRCPY(hd_pay_ym, pay_ym, sizeof(hd_pay_ym));
+
+    /* 근태 테이블에서 시간외/야간/휴일 시간 합산 */
+    EXEC SQL SELECT
+        NVL(SUM(OVERTIME_HOURS), 0),
+        NVL(SUM(NIGHT_HOURS), 0),
+        NVL(SUM(HOLIDAY_HOURS), 0)
+    INTO
+        :hd_overtime_hours, :hd_night_hours, :hd_holiday_hours
+    FROM TB_PAY_ATTENDANCE
+    WHERE EMP_NO = :hd_emp_no
+    AND   TO_CHAR(WORK_DATE, 'YYYYMM') = :hd_pay_ym;
+
+    if (sqlca.sqlcode != 0 && sqlca.sqlcode != 1403) {
+        PAY_LOG_WARN("Attendance query failed for %s/%s, sqlcode=%ld", emp_no, pay_ym, sqlca.sqlcode);
+        return PAY_SUCCESS;  /* 근태 없어도 에러 아님 */
+    }
+
+    /* 수당 계산 */
+    *overtime = ROUND_10(hourly_rate * OVERTIME_RATE * hd_overtime_hours);
+    *night    = ROUND_10(hourly_rate * NIGHT_RATE * hd_night_hours);
+    *holiday  = ROUND_10(hourly_rate * HOLIDAY_RATE * hd_holiday_hours);
+
+    /* 시간외수당 상한 체크 (기본급의 50%) */
+    double ot_limit = base_salary * 0.5;
+    if (*overtime > ot_limit) {
+        PAY_LOG_WARN("Overtime capped: %s %.0f -> %.0f", emp_no, *overtime, ot_limit);
+        *overtime = ot_limit;
+    }
+
+    return PAY_SUCCESS;
+}
+
+/*******************************************************************************
+ * pay_save_detail - 급여 명세 저장
+ *
+ * TB_PAY_DETAIL(마스터) + TB_PAY_DETAIL_ITEM(항목) 저장
+ ******************************************************************************/
+int pay_save_detail(const PAY_DETAIL *detail)
+{
+    int i;
+
+    PAY_CHECK_NULL(detail);
+
+    PAY_STRCPY(hd_emp_no, detail->emp_no, sizeof(hd_emp_no));
+    PAY_STRCPY(hd_pay_ym, detail->pay_ym, sizeof(hd_pay_ym));
+
+    /* 기존 데이터 삭제 (미확정건만) */
+    EXEC SQL DELETE FROM TB_PAY_DETAIL_ITEM
+        WHERE EMP_NO = :hd_emp_no AND PAY_YM = :hd_pay_ym
+        AND   EXISTS (SELECT 1 FROM TB_PAY_DETAIL D
+                      WHERE D.EMP_NO = :hd_emp_no AND D.PAY_YM = :hd_pay_ym AND D.STATUS = 'N');
+
+    EXEC SQL DELETE FROM TB_PAY_DETAIL
+        WHERE EMP_NO = :hd_emp_no AND PAY_YM = :hd_pay_ym AND STATUS = 'N';
+
+    /* 마스터 INSERT */
+    hd_gross_pay = detail->gross_pay;
+    hd_total_deduct = detail->total_deduct;
+    hd_net_pay = detail->net_pay;
+    hd_status[0] = detail->status;
+    hd_status[1] = '\0';
+
+    EXEC SQL INSERT INTO TB_PAY_DETAIL (
+        EMP_NO, PAY_YM, GROSS_PAY, TOTAL_DEDUCT, NET_PAY,
+        STATUS, REG_DATE
+    ) VALUES (
+        :hd_emp_no, :hd_pay_ym, :hd_gross_pay, :hd_total_deduct, :hd_net_pay,
+        :hd_status, SYSDATE
+    );
+
+    if (sqlca.sqlcode != 0) {
+        PAY_LOG_ERROR("Insert pay detail master failed: emp=%s sqlcode=%ld", detail->emp_no, sqlca.sqlcode);
+        EXEC SQL ROLLBACK;
+        return PAY_ERR_DB;
+    }
+
+    /* 수당 항목 INSERT */
+    for (i = 0; i < detail->allow_cnt; i++) {
+        hd_seq = i + 1;
+        PAY_STRCPY(hd_item_code, detail->allowances[i].item_code, sizeof(hd_item_code));
+        PAY_STRCPY(hd_item_name, detail->allowances[i].item_name, sizeof(hd_item_name));
+        hd_amount = detail->allowances[i].amount;
+        hd_tax_yn[0] = detail->allowances[i].tax_yn;
+        hd_tax_yn[1] = '\0';
+
+        EXEC SQL INSERT INTO TB_PAY_DETAIL_ITEM (
+            EMP_NO, PAY_YM, ITEM_TYPE, SEQ, ITEM_CODE, ITEM_NAME, AMOUNT, TAX_YN
+        ) VALUES (
+            :hd_emp_no, :hd_pay_ym, 'A', :hd_seq, :hd_item_code, :hd_item_name, :hd_amount, :hd_tax_yn
+        );
+
+        if (sqlca.sqlcode != 0) {
+            PAY_LOG_ERROR("Insert allowance item failed: emp=%s code=%s", detail->emp_no, hd_item_code);
+            /* 개별 항목 실패는 무시하고 계속 */
+        }
+    }
+
+    /* 공제 항목 INSERT */
+    for (i = 0; i < detail->deduct_cnt; i++) {
+        hd_seq = i + 1;
+        PAY_STRCPY(hd_item_code, detail->deductions[i].item_code, sizeof(hd_item_code));
+        PAY_STRCPY(hd_item_name, detail->deductions[i].item_name, sizeof(hd_item_name));
+        hd_amount = detail->deductions[i].amount;
+
+        EXEC SQL INSERT INTO TB_PAY_DETAIL_ITEM (
+            EMP_NO, PAY_YM, ITEM_TYPE, SEQ, ITEM_CODE, ITEM_NAME, AMOUNT, TAX_YN
+        ) VALUES (
+            :hd_emp_no, :hd_pay_ym, 'D', :hd_seq, :hd_item_code, :hd_item_name, :hd_amount, 'Y'
+        );
+
+        if (sqlca.sqlcode != 0) {
+            PAY_LOG_ERROR("Insert deduction item failed: emp=%s code=%s", detail->emp_no, hd_item_code);
+        }
+    }
+
+    return PAY_SUCCESS;
+}
+
+/*******************************************************************************
+ * pay_generate_slip - 급여명세서 출력
+ *
+ * 고정폭 포맷으로 급여명세서 생성
+ * (2018-11-20 김대리 - 포맷 개선)
+ ******************************************************************************/
+int pay_generate_slip(const PAY_DETAIL *detail, FILE *fp)
+{
+    int i;
+    int max_rows;
+    char amt_buf[20];
+
+    PAY_CHECK_NULL(detail);
+    if (fp == NULL) fp = stdout;
+
+    fprintf(fp, "+============================================================+\n");
+    fprintf(fp, "|                     급  여  명  세  서                      |\n");
+    fprintf(fp, "+============================================================+\n");
+    fprintf(fp, "| 사원번호: %-12s          급여년월: %-7s        |\n", detail->emp_no, detail->pay_ym);
+    fprintf(fp, "+-----------------------------+------------------------------+\n");
+    fprintf(fp, "|          수     당          |          공     제           |\n");
+    fprintf(fp, "+----------+------------------+----------+-------------------+\n");
+    fprintf(fp, "| 항목코드 |       금액       | 항목코드 |       금액        |\n");
+    fprintf(fp, "+----------+------------------+----------+-------------------+\n");
+
+    /* 수당/공제 병렬 출력 */
+    max_rows = detail->allow_cnt > detail->deduct_cnt ? detail->allow_cnt : detail->deduct_cnt;
+
+    for (i = 0; i < max_rows; i++) {
+        /* 수당 */
+        if (i < detail->allow_cnt) {
+            fprintf(fp, "| %-8s | %16.0f ", detail->allowances[i].item_name, detail->allowances[i].amount);
+        } else {
+            fprintf(fp, "|          |                  ");
+        }
+
+        /* 공제 */
+        if (i < detail->deduct_cnt) {
+            fprintf(fp, "| %-8s | %17.0f |\n", detail->deductions[i].item_name, detail->deductions[i].amount);
+        } else {
+            fprintf(fp, "|          |                   |\n");
+        }
+    }
+
+    fprintf(fp, "+----------+------------------+----------+-------------------+\n");
+    fprintf(fp, "| 수당합계 | %16.0f | 공제합계 | %17.0f |\n", detail->gross_pay, detail->total_deduct);
+    fprintf(fp, "+----------+------------------+----------+-------------------+\n");
+    fprintf(fp, "|                             실수령액 : %17.0f |\n", detail->net_pay);
+    fprintf(fp, "+============================================================+\n");
+
+    /* 2018-11-20 추가 - 세부 세금 내역 */
+    fprintf(fp, "\n [세금/공과금 내역]\n");
+    fprintf(fp, "   소득세    : %12.0f원\n", detail->income_tax);
+    fprintf(fp, "   주민세    : %12.0f원\n", detail->local_tax);
+    fprintf(fp, "   국민연금  : %12.0f원\n", detail->nps);
+    fprintf(fp, "   건강보험  : %12.0f원\n", detail->nhi);
+    fprintf(fp, "   장기요양  : %12.0f원\n", detail->ltc);
+    fprintf(fp, "   고용보험  : %12.0f원\n", detail->ei);
+    fprintf(fp, "\n");
+
+    return PAY_SUCCESS;
+}

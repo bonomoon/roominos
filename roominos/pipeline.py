@@ -296,6 +296,14 @@ class Pipeline:
                 changed = True
                 issues_found += 1
 
+            # Replace @DataJpaTest with @SpringBootTest (Judge requires @SpringBootTest)
+            if "Test.java" in path and "@DataJpaTest" in content:
+                content = content.replace("@DataJpaTest", "@SpringBootTest")
+                content = content.replace("import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;",
+                                         "import org.springframework.boot.test.context.SpringBootTest;")
+                changed = True
+                issues_found += 1
+
             # Add @SpringBootTest to test files missing it
             if "Test.java" in path and "@SpringBootTest" not in content and "class " in content:
                 content = content.replace(

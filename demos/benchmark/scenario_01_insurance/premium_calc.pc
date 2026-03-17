@@ -1,0 +1,590 @@
+/*******************************************************************************
+ * premium_calc.pc - 보험료 계산 모듈
+ *
+ * 작성일: 2008-03-15
+ * 수정일: 2012-06-20  최차장 - 유니버셜 보험료 계산 추가
+ * 수정일: 2016-11-08  김대리 - 단체할인 반영
+ * 수정일: 2019-04-22  박과장 - 나이별 세분화 요율
+ * 수정일: 2021-08-15  이사원 - 특약 할인율 추가
+ *
+ * 보험료 계산 엔진
+ * - 주계약 보험료: 기본료 * 나이계수 * 성별계수 * 등급계수 * 기간계수 * 주기계수
+ * - 특약 보험료: 특약기본료 * 나이계수 * 등급계수
+ * - 총 보험료: 주계약 + 특약합계 - 할인 + 할증
+ ******************************************************************************/
+
+#include "common_ins.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    char    hp_prod_code[MAX_PROD_CODE];
+    char    hp_contract_no[MAX_CONTRACT_NO];
+    double  hp_base_premium;
+    double  hp_insured_amt;
+    double  hp_new_premium;
+    double  hp_rider_premium;
+    int     hp_age;
+    char    hp_sex_code[2];
+    char    hp_grade_code[3];
+    int     hp_ins_period;
+    int     hp_pay_period;
+    char    hp_pay_cycle[2];
+    char    hp_status_code[3];
+    int     hp_count;
+    double  hp_total_premium;
+    double  hp_main_premium;
+    double  hp_rider_premium_sum;
+    char    hp_upd_user[20];
+EXEC SQL END DECLARE SECTION;
+
+/* 전역 - 나이별 요율 테이블 (2019-04-22 세분화) */
+static double g_male_rate_table[101];    /* 0세 ~ 100세 */
+static double g_female_rate_table[101];
+static int    g_rate_table_loaded = 0;
+
+/* 2012-06-20 추가 - 유니버셜 관련 전역 변수 */
+static double g_universal_base_rate = 0.035;
+static double g_universal_min_premium = 50000.0;
+/* static double g_universal_max_premium = 5000000.0; */  /* 2018 사용안함 */
+
+/*******************************************************************************
+ * init_rate_table - 나이별 요율 테이블 초기화
+ *
+ * 실제로는 DB에서 로드해야 하지만 성능 이슈로 하드코딩 (2019-04-22)
+ * TODO: DB 테이블(TB_INS_RATE)에서 로드하도록 변경 필요
+ ******************************************************************************/
+static void init_rate_table(void)
+{
+    int i;
+
+    if (g_rate_table_loaded) return;
+
+    /* 기본 요율 설정 - 나이별 선형 보간 */
+    for (i = 0; i <= 100; i++) {
+        if (i < 20) {
+            g_male_rate_table[i] = 0.0120 + (i * 0.00016);
+            g_female_rate_table[i] = 0.0100 + (i * 0.00014);
+        } else if (i < 30) {
+            g_male_rate_table[i] = BASE_RATE_MALE_20 + ((i - 20) * (BASE_RATE_MALE_30 - BASE_RATE_MALE_20) / 10.0);
+            g_female_rate_table[i] = BASE_RATE_FEMALE_20 + ((i - 20) * (BASE_RATE_FEMALE_30 - BASE_RATE_FEMALE_20) / 10.0);
+        } else if (i < 40) {
+            g_male_rate_table[i] = BASE_RATE_MALE_30 + ((i - 30) * (BASE_RATE_MALE_40 - BASE_RATE_MALE_30) / 10.0);
+            g_female_rate_table[i] = BASE_RATE_FEMALE_30 + ((i - 30) * (BASE_RATE_FEMALE_40 - BASE_RATE_FEMALE_30) / 10.0);
+        } else if (i < 50) {
+            g_male_rate_table[i] = BASE_RATE_MALE_40 + ((i - 40) * (BASE_RATE_MALE_50 - BASE_RATE_MALE_40) / 10.0);
+            g_female_rate_table[i] = BASE_RATE_FEMALE_40 + ((i - 40) * (BASE_RATE_FEMALE_50 - BASE_RATE_FEMALE_40) / 10.0);
+        } else if (i < 60) {
+            g_male_rate_table[i] = BASE_RATE_MALE_50 + ((i - 50) * (BASE_RATE_MALE_60 - BASE_RATE_MALE_50) / 10.0);
+            g_female_rate_table[i] = BASE_RATE_FEMALE_50 + ((i - 50) * (BASE_RATE_FEMALE_60 - BASE_RATE_FEMALE_50) / 10.0);
+        } else {
+            /* 60세 이상은 매년 3% 증가 */
+            g_male_rate_table[i] = BASE_RATE_MALE_60 * (1.0 + 0.03 * (i - 60));
+            g_female_rate_table[i] = BASE_RATE_FEMALE_60 * (1.0 + 0.03 * (i - 60));
+        }
+    }
+
+    g_rate_table_loaded = 1;
+}
+
+/*******************************************************************************
+ * calc_age_factor - 나이 계수 계산
+ *
+ * 나이와 성별에 따른 위험률 계수 반환
+ * 나이 범위: 0 ~ 80 (80세 초과 인수 거절)
+ ******************************************************************************/
+int calc_age_factor(int age, char sex_code, double *factor)
+{
+    CHECK_NULL(factor);
+
+    init_rate_table();
+
+    if (age < 0 || age > 80) {
+        LOG_ERROR(ERR_CALC_INVALID_AGE, "Age out of range (0-80)");
+        *factor = 0.0;
+        return ERR_CALC_INVALID_AGE;
+    }
+
+    if (sex_code != 'M' && sex_code != 'F') {
+        LOG_ERROR(ERR_CALC_INVALID_SEX, "Invalid sex code");
+        *factor = 0.0;
+        return ERR_CALC_INVALID_SEX;
+    }
+
+    if (sex_code == 'M') {
+        *factor = g_male_rate_table[age] / BASE_RATE_MALE_30;  /* 30세 남성 기준 1.0 */
+    } else {
+        *factor = g_female_rate_table[age] / BASE_RATE_FEMALE_30;  /* 30세 여성 기준 1.0 */
+    }
+
+    /* 소수점 4자리 반올림 */
+    *factor = ((int)(*factor * 10000 + 0.5)) / 10000.0;
+
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * calc_grade_factor - 건강등급 계수 계산
+ *
+ * 등급: S1(우량체), S2(표준우량), S3(표준), S4(표준미달1), S5(표준미달2)
+ ******************************************************************************/
+int calc_grade_factor(const char *grade_code, double *factor)
+{
+    CHECK_NULL(grade_code);
+    CHECK_NULL(factor);
+
+    if (strcmp(grade_code, "S1") == 0) {
+        *factor = GRADE_SUPER;
+    } else if (strcmp(grade_code, "S2") == 0) {
+        *factor = GRADE_PREF;
+    } else if (strcmp(grade_code, "S3") == 0) {
+        *factor = GRADE_STD;
+    } else if (strcmp(grade_code, "S4") == 0) {
+        *factor = GRADE_SUB1;
+    } else if (strcmp(grade_code, "S5") == 0) {
+        *factor = GRADE_SUB2;
+    } else if (strcmp(grade_code, "XX") == 0) {
+        /* 인수거절 */
+        *factor = GRADE_DECLINE;
+        return ERR_CALC_INVALID_GRADE;
+    } else {
+        /* 미설정인 경우 표준체 */
+        *factor = GRADE_STD;
+    }
+
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * calc_cycle_factor - 납입주기 계수
+ *
+ * 월납 기준 1.0, 분기납/반기납/연납은 할인 적용
+ ******************************************************************************/
+int calc_cycle_factor(const char *pay_cycle, double *factor)
+{
+    CHECK_NULL(pay_cycle);
+    CHECK_NULL(factor);
+
+    if (strcmp(pay_cycle, PAY_MONTHLY) == 0) {
+        *factor = 1.0;
+    } else if (strcmp(pay_cycle, PAY_QUARTERLY) == 0) {
+        *factor = 0.97;   /* 3% 할인 */
+    } else if (strcmp(pay_cycle, PAY_SEMIANNUAL) == 0) {
+        *factor = 0.95;   /* 5% 할인 */
+    } else if (strcmp(pay_cycle, PAY_ANNUAL) == 0) {
+        *factor = 0.92;   /* 8% 할인 */
+    } else if (strcmp(pay_cycle, PAY_SINGLE) == 0) {
+        *factor = 0.85;   /* 일시납 15% 할인 */
+    } else {
+        *factor = 1.0;    /* 기본값 월납 */
+    }
+
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * calc_period_factor - 보험기간/납입기간 계수
+ *
+ * 보험기간이 길수록, 납입기간이 짧을수록 보험료 증가
+ ******************************************************************************/
+int calc_period_factor(int ins_period, int pay_period, double *factor)
+{
+    double ins_f, pay_f;
+
+    CHECK_NULL(factor);
+
+    if (ins_period <= 0 || pay_period <= 0) {
+        *factor = 1.0;
+        return ERR_INVALID_PARAM;
+    }
+
+    /* 보험기간 계수: 10년 기준 1.0 */
+    if (ins_period <= 10) {
+        ins_f = 0.8 + (ins_period * 0.02);
+    } else if (ins_period <= 20) {
+        ins_f = 1.0 + ((ins_period - 10) * 0.015);
+    } else if (ins_period <= 30) {
+        ins_f = 1.15 + ((ins_period - 20) * 0.012);
+    } else {
+        ins_f = 1.27 + ((ins_period - 30) * 0.01);   /* 종신보험 등 */
+    }
+
+    /* 납입기간 계수: 보험기간 대비 비율 */
+    if (pay_period >= ins_period) {
+        pay_f = 1.0;     /* 전기납 */
+    } else {
+        /* 단기납: 납입기간 짧을수록 보험료 높음 */
+        pay_f = 1.0 + ((double)(ins_period - pay_period) / ins_period * 0.3);
+    }
+
+    *factor = ins_f * pay_f;
+
+    /* 소수점 4자리 반올림 */
+    *factor = ((int)(*factor * 10000 + 0.5)) / 10000.0;
+
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * calc_main_premium - 주계약 보험료 계산
+ *
+ * 계산식: 기본보험료 * 나이계수 * 등급계수 * 기간계수 * 주기계수
+ * (성별은 나이계수에 포함)
+ ******************************************************************************/
+int calc_main_premium(const PRODUCT_INFO *product, const CUSTOMER_INFO *customer, double *premium)
+{
+    double age_f, grade_f, period_f;
+    double base;
+    int rc;
+
+    CHECK_NULL(product);
+    CHECK_NULL(customer);
+    CHECK_NULL(premium);
+
+    *premium = 0.0;
+    base = product->base_premium;
+
+    if (base <= 0) {
+        LOG_ERROR(ERR_PREMIUM_ZERO, "Base premium is zero or negative");
+        return ERR_PREMIUM_ZERO;
+    }
+
+    /* 유니버셜 보험 별도 계산 (2012-06-20 추가) */
+    if (product->prod_type == 'U') {
+        double universal_prem = product->insured_amt * g_universal_base_rate / 12.0;
+        if (universal_prem < g_universal_min_premium) {
+            universal_prem = g_universal_min_premium;
+        }
+
+        /* 나이에 따른 위험보험료 가산 */
+        rc = calc_age_factor(customer->age, customer->sex_code, &age_f);
+        if (rc != ERR_SUCCESS) return rc;
+
+        universal_prem += (product->insured_amt * 0.001 * age_f);
+
+        /* 등급 반영 */
+        rc = calc_grade_factor(customer->grade_code, &grade_f);
+        if (rc != ERR_SUCCESS) return rc;
+
+        universal_prem *= grade_f;
+
+        *premium = ((int)(universal_prem / 10 + 0.5)) * 10;  /* 10원 단위 절사 */
+        return ERR_SUCCESS;
+    }
+
+    /* 일반 보험 계산 */
+    rc = calc_age_factor(customer->age, customer->sex_code, &age_f);
+    if (rc != ERR_SUCCESS) return rc;
+
+    rc = calc_grade_factor(customer->grade_code, &grade_f);
+    if (rc != ERR_SUCCESS) return rc;
+
+    rc = calc_period_factor(product->ins_period, product->pay_period, &period_f);
+    if (rc != ERR_SUCCESS) return rc;
+
+    *premium = base * age_f * grade_f * period_f;
+
+    /* 가입금액 비례 보정 */
+    if (product->insured_amt > 0) {
+        double amt_factor = product->insured_amt / 100000000.0;  /* 1억 기준 */
+        if (amt_factor < 0.5) amt_factor = 0.5;
+        if (amt_factor > 5.0) amt_factor = 5.0;
+        *premium *= amt_factor;
+    }
+
+    /* 상품유형별 보정 */
+    switch (product->prod_type) {
+        case 'L':  /* 종신보험 */
+            *premium *= 1.15;
+            break;
+        case 'T':  /* 정기보험 */
+            *premium *= 0.85;
+            break;
+        case 'E':  /* 양로보험 */
+            *premium *= 1.25;
+            break;
+        default:
+            break;
+    }
+
+    /* 10원 단위 절사 */
+    *premium = ((int)(*premium / 10 + 0.5)) * 10;
+
+    /* 2016-02-20 한도 체크 - 사용안함 */
+    /* if (*premium > 10000000) *premium = 10000000; */
+
+    if (*premium <= 0) {
+        LOG_ERROR(ERR_PREMIUM_ZERO, "Calculated premium is zero");
+        return ERR_PREMIUM_ZERO;
+    }
+
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * calc_rider_premium - 특약 보험료 계산
+ *
+ * 특약유형별 계수:
+ *   D(사망): 1.0
+ *   H(입원): 0.8
+ *   S(수술): 0.6
+ *   C(진단): 1.2
+ ******************************************************************************/
+int calc_rider_premium(const RIDER_INFO *rider, const CUSTOMER_INFO *customer, double *premium)
+{
+    double age_f, grade_f, type_f;
+    int rc;
+
+    CHECK_NULL(rider);
+    CHECK_NULL(customer);
+    CHECK_NULL(premium);
+
+    *premium = 0.0;
+
+    if (rider->rider_premium <= 0 && rider->rider_amt <= 0) {
+        return ERR_SUCCESS;  /* 0원 특약 허용 */
+    }
+
+    rc = calc_age_factor(customer->age, customer->sex_code, &age_f);
+    if (rc != ERR_SUCCESS) return rc;
+
+    rc = calc_grade_factor(customer->grade_code, &grade_f);
+    if (rc != ERR_SUCCESS) return rc;
+
+    /* 특약유형별 계수 */
+    switch (rider->rider_type) {
+        case 'D': type_f = 1.0;  break;
+        case 'H': type_f = 0.8;  break;
+        case 'S': type_f = 0.6;  break;
+        case 'C': type_f = 1.2;  break;
+        default:  type_f = 1.0;  break;
+    }
+
+    /* 특약보험료 = 기본특약료 * 나이계수 * 등급계수 * 유형계수 */
+    if (rider->rider_premium > 0) {
+        *premium = rider->rider_premium * age_f * grade_f * type_f;
+    } else {
+        /* 가입금액 기준 산출 (기본료 없는 경우) */
+        *premium = rider->rider_amt * 0.002 * age_f * grade_f * type_f;
+    }
+
+    /* 2021-08-15 이사원 추가 - 특약 다건 할인 */
+    /* 이 함수 레벨에서는 적용 불가 - calc_premium에서 일괄 적용 */
+
+    /* 10원 단위 절사 */
+    *premium = ((int)(*premium / 10 + 0.5)) * 10;
+
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * calc_premium - 보험료 종합 계산
+ *
+ * 주계약 + 특약 + 할인/할증 = 총보험료
+ ******************************************************************************/
+int calc_premium(const CONTRACT_INFO *contract, PREMIUM_RESULT *result)
+{
+    double cycle_f;
+    double rider_discount = 0.0;
+    int rc, i;
+
+    CHECK_NULL(contract);
+    CHECK_NULL(result);
+    memset(result, 0, sizeof(PREMIUM_RESULT));
+
+    /* 주계약 보험료 */
+    rc = calc_main_premium(&contract->product, &contract->customer, &result->main_premium);
+    if (rc != ERR_SUCCESS) {
+        result->err_code = rc;
+        sprintf(result->err_msg, "Main premium calc failed: rc=%d", rc);
+        return rc;
+    }
+
+    /* 특약 보험료 */
+    result->total_rider_premium = 0.0;
+    for (i = 0; i < contract->rider_cnt && i < MAX_RIDER_CNT; i++) {
+        rc = calc_rider_premium(&contract->riders[i], &contract->customer, &result->rider_premiums[i]);
+        if (rc != ERR_SUCCESS) {
+            /* 특약 계산 실패시 해당 특약만 0원 처리 */
+            result->rider_premiums[i] = 0.0;
+            char warn_buf[256];
+            sprintf(warn_buf, "Rider %s premium calc failed (rc=%d), set to 0", contract->riders[i].rider_code, rc);
+            LOG_ERROR(rc, warn_buf);
+        }
+        result->total_rider_premium += result->rider_premiums[i];
+    }
+
+    /* 2021-08-15 이사원 추가 - 특약 다건 할인 */
+    if (contract->rider_cnt >= 3) {
+        rider_discount = result->total_rider_premium * 0.05;  /* 3건 이상 5% 할인 */
+    }
+    if (contract->rider_cnt >= 5) {
+        rider_discount = result->total_rider_premium * 0.08;  /* 5건 이상 8% 할인 */
+    }
+
+    /* 납입주기 계수 적용 */
+    rc = calc_cycle_factor(contract->pay_cycle, &cycle_f);
+    if (rc != ERR_SUCCESS) {
+        cycle_f = 1.0;  /* 기본값 */
+    }
+    result->cycle_factor = cycle_f;
+
+    /* 총보험료 = (주계약 + 특약합계 - 특약할인) * 주기계수 */
+    result->total_premium = (result->main_premium + result->total_rider_premium - rider_discount) * cycle_f;
+    result->discount_amt = rider_discount + (result->total_premium * (1.0 - cycle_f));
+
+    /* 10원 단위 절사 */
+    result->total_premium = ((int)(result->total_premium / 10 + 0.5)) * 10;
+
+    /* 계수 기록 */
+    calc_age_factor(contract->customer.age, contract->customer.sex_code, &result->age_factor);
+    result->sex_factor = (contract->customer.sex_code == 'M') ? 1.0 : 0.85;
+    calc_grade_factor(contract->customer.grade_code, &result->grade_factor);
+    calc_period_factor(contract->product.ins_period, contract->product.pay_period, &result->period_factor);
+
+    result->err_code = ERR_SUCCESS;
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * recalc_all_premiums - 상품코드 기준 전체 보험료 재계산
+ *
+ * 요율 변경시 해당 상품의 모든 정상계약 보험료를 재계산
+ * 배치용 - COMMIT_UNIT 단위 커밋
+ ******************************************************************************/
+int recalc_all_premiums(const char *prod_code, int *processed_cnt)
+{
+    CONTRACT_INFO contract;
+    PREMIUM_RESULT prem_result;
+    int total = 0, success = 0, fail = 0;
+    int commit_cnt = 0;
+    int rc;
+    char log_buf[512];
+
+    CHECK_NULL(prod_code);
+    CHECK_NULL(processed_cnt);
+    *processed_cnt = 0;
+
+    SAFE_STRCPY(hp_prod_code, prod_code, sizeof(hp_prod_code));
+
+    sprintf(log_buf, "=== Premium recalculation started for product: %s ===", prod_code);
+    LOG_INFO(log_buf);
+
+    EXEC SQL DECLARE cur_recalc CURSOR FOR
+        SELECT C.CONTRACT_NO, C.STATUS_CODE, C.PAY_CYCLE,
+               C.TOTAL_PREMIUM, C.MAIN_PREMIUM, C.RIDER_PREMIUM_SUM,
+               U.CUST_NO, U.CUST_NAME, U.BIRTH_DATE, U.SEX_CODE, U.AGE,
+               U.GRADE_CODE,
+               P.PROD_CODE, P.PROD_NAME, P.PROD_TYPE,
+               P.INS_PERIOD, P.PAY_PERIOD, P.BASE_PREMIUM, P.INSURED_AMT
+        FROM   TB_INS_CONTRACT C
+        INNER JOIN TB_INS_CUSTOMER U ON C.CUST_NO = U.CUST_NO
+        INNER JOIN TB_INS_PRODUCT  P ON C.PROD_CODE = P.PROD_CODE
+        WHERE  C.PROD_CODE = :hp_prod_code
+        AND    C.STATUS_CODE = '01'
+        ORDER BY C.CONTRACT_NO
+        FOR UPDATE OF C.TOTAL_PREMIUM;
+
+    EXEC SQL OPEN cur_recalc;
+    if (sqlca.sqlcode != 0) {
+        LOG_ERROR(ERR_DB_SELECT, "Failed to open recalc cursor");
+        return ERR_DB_SELECT;
+    }
+
+    while (1) {
+        EXEC SQL FETCH cur_recalc INTO
+            :hp_contract_no, :hp_status_code, :hp_pay_cycle,
+            :hp_total_premium, :hp_main_premium, :hp_rider_premium_sum,
+            :h_cust_no, :h_cust_name, :h_birth_date, :hp_sex_code, :hp_age,
+            :hp_grade_code,
+            :hp_prod_code, :h_prod_name, :h_prod_type,
+            :hp_ins_period, :hp_pay_period, :hp_base_premium, :hp_insured_amt;
+
+        if (sqlca.sqlcode == 1403) break;
+        if (sqlca.sqlcode != 0) {
+            sprintf(log_buf, "Fetch error: sqlcode=%ld", sqlca.sqlcode);
+            LOG_ERROR((int)sqlca.sqlcode, log_buf);
+            break;
+        }
+
+        total++;
+
+        /* 구조체 구성 */
+        memset(&contract, 0, sizeof(CONTRACT_INFO));
+        SAFE_STRCPY(contract.contract_no, hp_contract_no, sizeof(contract.contract_no));
+        SAFE_STRCPY(contract.pay_cycle, hp_pay_cycle, sizeof(contract.pay_cycle));
+        SAFE_STRCPY(contract.customer.cust_no, h_cust_no, sizeof(contract.customer.cust_no));
+        contract.customer.age = hp_age;
+        contract.customer.sex_code = hp_sex_code[0];
+        SAFE_STRCPY(contract.customer.grade_code, hp_grade_code, sizeof(contract.customer.grade_code));
+        SAFE_STRCPY(contract.product.prod_code, hp_prod_code, sizeof(contract.product.prod_code));
+        contract.product.prod_type = h_prod_type[0];
+        contract.product.ins_period = hp_ins_period;
+        contract.product.pay_period = hp_pay_period;
+        contract.product.base_premium = hp_base_premium;
+        contract.product.insured_amt = hp_insured_amt;
+
+        /* 특약 로드 - common_ins.h에 선언된 외부함수 사용 불가, 직접 로드 */
+        /* 여기서는 특약 없이 주계약만 재계산 */
+        contract.rider_cnt = 0;
+
+        /* 보험료 재계산 */
+        rc = calc_premium(&contract, &prem_result);
+        if (rc != ERR_SUCCESS) {
+            fail++;
+            sprintf(log_buf, "Recalc failed: contract=%s, rc=%d", hp_contract_no, rc);
+            LOG_ERROR(rc, log_buf);
+            continue;
+        }
+
+        /* 변경된 보험료 UPDATE */
+        hp_new_premium = prem_result.total_premium;
+        hp_main_premium = prem_result.main_premium;
+
+        EXEC SQL UPDATE TB_INS_CONTRACT
+        SET    TOTAL_PREMIUM = :hp_new_premium,
+               MAIN_PREMIUM  = :hp_main_premium,
+               UPD_USER      = 'BATCH_RECALC',
+               UPD_DATE      = SYSDATE
+        WHERE CURRENT OF cur_recalc;
+
+        if (sqlca.sqlcode != 0) {
+            fail++;
+            sprintf(log_buf, "Update failed: contract=%s, sqlcode=%ld", hp_contract_no, sqlca.sqlcode);
+            LOG_ERROR((int)sqlca.sqlcode, log_buf);
+            continue;
+        }
+
+        success++;
+        commit_cnt++;
+
+        /* 변경 내역 로그 */
+        if (hp_total_premium != hp_new_premium) {
+            sprintf(log_buf, "Premium changed: %s %.0f -> %.0f (diff=%.0f)", hp_contract_no, hp_total_premium, hp_new_premium, hp_new_premium - hp_total_premium);
+            LOG_INFO(log_buf);
+        }
+
+        /* COMMIT_UNIT 단위 커밋 */
+        if (commit_cnt >= COMMIT_UNIT) {
+            EXEC SQL COMMIT;
+            if (sqlca.sqlcode != 0) {
+                LOG_ERROR(ERR_DB_COMMIT, "Batch commit failed during recalc");
+                break;
+            }
+            commit_cnt = 0;
+        }
+    }
+
+    /* 잔여 건 커밋 */
+    if (commit_cnt > 0) {
+        EXEC SQL COMMIT;
+    }
+
+    EXEC SQL CLOSE cur_recalc;
+
+    *processed_cnt = success;
+    sprintf(log_buf, "=== Recalc completed. Total=%d, Success=%d, Fail=%d ===", total, success, fail);
+    LOG_INFO(log_buf);
+
+    return ERR_SUCCESS;
+}

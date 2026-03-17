@@ -1,0 +1,1025 @@
+/*******************************************************************************
+ * contract_main.pc - 보험 계약 관리 메인 프로그램
+ *
+ * 작성일: 2008-03-15
+ * 수정일: 2015-07-20  최차장 - FOR UPDATE NOWAIT 추가
+ * 수정일: 2018-02-14  김대리 - SAVEPOINT 적용
+ * 수정일: 2020-09-01  박과장 - 실효 배치 로직 수정
+ * 수정일: 2022-03-10  이사원 - 지점별 조회 추가
+ *
+ * 계약 CRUD + 상태변경 + 배치 실효처리
+ * Oracle Pro*C precompiler 필요
+ ******************************************************************************/
+
+#include "common_ins.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+/* 호스트 변수 선언 영역 */
+EXEC SQL BEGIN DECLARE SECTION;
+    char    h_contract_no[MAX_CONTRACT_NO];
+    char    h_cust_no[MAX_CONTRACT_NO];
+    char    h_cust_name[MAX_CUST_NAME];
+    char    h_birth_date[MAX_DATE_LEN];
+    char    h_sex_code[2];
+    int     h_age;
+    char    h_phone[MAX_PHONE];
+    char    h_addr[MAX_ADDR];
+    char    h_grade_code[3];
+    char    h_prod_code[MAX_PROD_CODE];
+    char    h_prod_name[MAX_PRODUCT_NAME];
+    char    h_prod_type[2];
+    int     h_ins_period;
+    int     h_pay_period;
+    double  h_base_premium;
+    double  h_insured_amt;
+    char    h_status_code[3];
+    char    h_contract_date[MAX_DATE_LEN];
+    char    h_commence_date[MAX_DATE_LEN];
+    char    h_maturity_date[MAX_DATE_LEN];
+    char    h_pay_cycle[2];
+    double  h_total_premium;
+    double  h_main_premium;
+    double  h_rider_premium_sum;
+    char    h_branch_code[MAX_BRANCH_CODE];
+    char    h_last_pay_date[MAX_DATE_LEN];
+    int     h_unpaid_months;
+    char    h_note[MAX_NOTE];
+    char    h_reg_user[20];
+    char    h_reg_date[MAX_DATETIME_LEN];
+    char    h_upd_user[20];
+    char    h_upd_date[MAX_DATETIME_LEN];
+    /* 특약 호스트 변수 */
+    char    h_rider_code[MAX_PROD_CODE];
+    char    h_rider_name[MAX_PRODUCT_NAME];
+    double  h_rider_premium;
+    double  h_rider_amt;
+    char    h_rider_type[2];
+    /* 수익자 호스트 변수 */
+    char    h_benef_name[MAX_CUST_NAME];
+    char    h_benef_rel[10];
+    double  h_benef_ratio;
+    char    h_benef_type[2];
+    /* 검색 조건 */
+    char    h_from_date[MAX_DATE_LEN];
+    char    h_to_date[MAX_DATE_LEN];
+    char    h_base_date[MAX_DATE_LEN];
+    /* 카운트 */
+    int     h_count;
+    /* DB 접속 정보 */
+    char    h_db_user[50];
+    char    h_db_pass[50];
+    char    h_db_name[50];
+EXEC SQL END DECLARE SECTION;
+
+/* 전역 변수 */
+static int  g_connected = 0;                /* DB 접속 여부 */
+static int  g_batch_mode = 0;               /* 배치모드 여부 */
+static int  g_commit_count = 0;             /* 커밋 카운터 */
+static char g_user_id[20] = "SYSTEM";       /* 현재 사용자 ID */
+static char g_today[MAX_DATE_LEN];          /* 오늘 날짜 */
+static FILE *g_logfp = NULL;                /* 로그 파일 포인터 */
+
+/* 2020-05-15 사용안함 - 예전 배치 로그 경로 */
+/* static char g_old_log_path[256] = "/app/ins/log/batch_old.log"; */
+
+/*******************************************************************************
+ * db_connect - 데이터베이스 접속
+ ******************************************************************************/
+static int db_connect(const char *user, const char *pass, const char *dbname)
+{
+    if (g_connected) {
+        LOG_INFO("Already connected to database");
+        return ERR_SUCCESS;
+    }
+
+    SAFE_STRCPY(h_db_user, user, sizeof(h_db_user));
+    SAFE_STRCPY(h_db_pass, pass, sizeof(h_db_pass));
+    SAFE_STRCPY(h_db_name, dbname, sizeof(h_db_name));
+
+    EXEC SQL CONNECT :h_db_user IDENTIFIED BY :h_db_pass USING :h_db_name;
+
+    if (sqlca.sqlcode != 0) {
+        char errbuf[256];
+        sprintf(errbuf, "DB Connect failed: %.*s", (int)sqlca.sqlerrm.sqlerrml, sqlca.sqlerrm.sqlerrmc);
+        LOG_ERROR(ERR_DB_CONNECT, errbuf);
+        return ERR_DB_CONNECT;
+    }
+
+    g_connected = 1;
+    LOG_INFO("Database connected successfully");
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * db_disconnect - 데이터베이스 접속 해제
+ ******************************************************************************/
+static int db_disconnect(void)
+{
+    if (!g_connected) return ERR_SUCCESS;
+
+    EXEC SQL COMMIT WORK RELEASE;
+
+    g_connected = 0;
+    LOG_INFO("Database disconnected");
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * write_batch_log - 배치 로그 기록
+ ******************************************************************************/
+static void write_batch_log(const char *msg)
+{
+    char datetime_buf[MAX_DATETIME_LEN];
+    get_current_datetime(datetime_buf, sizeof(datetime_buf));
+
+    if (g_logfp != NULL) {
+        fprintf(g_logfp, "[%s] %s\n", datetime_buf, msg);
+        fflush(g_logfp);
+    }
+    if (!g_batch_mode) {
+        printf("[%s] %s\n", datetime_buf, msg);
+    }
+}
+
+/*******************************************************************************
+ * load_riders - 특약 정보 로드 (계약번호 기준)
+ ******************************************************************************/
+static int load_riders(const char *contract_no, RIDER_INFO *riders, int *cnt)
+{
+    int idx = 0;
+
+    SAFE_STRCPY(h_contract_no, contract_no, sizeof(h_contract_no));
+
+    EXEC SQL DECLARE cur_rider CURSOR FOR
+        SELECT RIDER_CODE, RIDER_NAME, RIDER_PREMIUM, RIDER_AMT, RIDER_TYPE
+        FROM   TB_INS_RIDER
+        WHERE  CONTRACT_NO = :h_contract_no
+        AND    USE_YN = 'Y'
+        ORDER BY RIDER_CODE;
+
+    EXEC SQL OPEN cur_rider;
+
+    if (sqlca.sqlcode != 0) {
+        LOG_ERROR(ERR_DB_SELECT, "Failed to open rider cursor");
+        return ERR_DB_SELECT;
+    }
+
+    while (idx < MAX_RIDER_CNT) {
+        EXEC SQL FETCH cur_rider
+            INTO :h_rider_code, :h_rider_name, :h_rider_premium, :h_rider_amt, :h_rider_type;
+
+        if (sqlca.sqlcode == 1403) break;  /* NOT FOUND */
+        if (sqlca.sqlcode != 0) {
+            EXEC SQL CLOSE cur_rider;
+            return ERR_DB_SELECT;
+        }
+
+        SAFE_STRCPY(riders[idx].rider_code, h_rider_code, sizeof(riders[idx].rider_code));
+        SAFE_STRCPY(riders[idx].rider_name, h_rider_name, sizeof(riders[idx].rider_name));
+        riders[idx].rider_premium = h_rider_premium;
+        riders[idx].rider_amt = h_rider_amt;
+        riders[idx].rider_type = h_rider_type[0];
+        idx++;
+    }
+
+    EXEC SQL CLOSE cur_rider;
+    *cnt = idx;
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * load_beneficiaries - 수익자 정보 로드
+ ******************************************************************************/
+static int load_beneficiaries(const char *contract_no, BENEFICIARY_INFO *benefs, int *cnt)
+{
+    int idx = 0;
+
+    SAFE_STRCPY(h_contract_no, contract_no, sizeof(h_contract_no));
+
+    EXEC SQL DECLARE cur_benef CURSOR FOR
+        SELECT BENEF_NAME, BENEF_REL, BENEF_RATIO, BENEF_TYPE
+        FROM   TB_INS_BENEFICIARY
+        WHERE  CONTRACT_NO = :h_contract_no
+        ORDER BY BENEF_TYPE, BENEF_RATIO DESC;
+
+    EXEC SQL OPEN cur_benef;
+    if (sqlca.sqlcode != 0) return ERR_DB_SELECT;
+
+    while (idx < MAX_BENEFICIARY_CNT) {
+        EXEC SQL FETCH cur_benef
+            INTO :h_benef_name, :h_benef_rel, :h_benef_ratio, :h_benef_type;
+
+        if (sqlca.sqlcode == 1403) break;
+        if (sqlca.sqlcode != 0) { EXEC SQL CLOSE cur_benef; return ERR_DB_SELECT; }
+
+        SAFE_STRCPY(benefs[idx].benef_name, h_benef_name, sizeof(benefs[idx].benef_name));
+        SAFE_STRCPY(benefs[idx].benef_rel, h_benef_rel, sizeof(benefs[idx].benef_rel));
+        benefs[idx].benef_ratio = h_benef_ratio;
+        benefs[idx].benef_type = h_benef_type[0];
+        idx++;
+    }
+
+    EXEC SQL CLOSE cur_benef;
+    *cnt = idx;
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * ins_select_contract - 계약 조회
+ *
+ * 계약번호로 계약 마스터 + 고객 + 상품 + 특약 + 수익자 전체 조회
+ * FOR UPDATE NOWAIT로 잠금 (2015-07-20 추가)
+ ******************************************************************************/
+int ins_select_contract(const char *contract_no, CONTRACT_INFO *info)
+{
+    int rc;
+
+    CHECK_NULL(contract_no);
+    CHECK_NULL(info);
+    memset(info, 0, sizeof(CONTRACT_INFO));
+
+    SAFE_STRCPY(h_contract_no, contract_no, sizeof(h_contract_no));
+
+    /* 계약 마스터 + 고객 + 상품 조인 조회 - FOR UPDATE NOWAIT */
+    EXEC SQL SELECT
+        C.CONTRACT_NO, C.STATUS_CODE, C.CONTRACT_DATE, C.COMMENCE_DATE,
+        C.MATURITY_DATE, C.PAY_CYCLE, C.TOTAL_PREMIUM, C.MAIN_PREMIUM,
+        C.RIDER_PREMIUM_SUM, C.BRANCH_CODE, C.LAST_PAY_DATE, C.UNPAID_MONTHS,
+        C.NOTE, C.REG_USER, TO_CHAR(C.REG_DATE, 'YYYY-MM-DD HH24:MI:SS'),
+        C.UPD_USER, NVL(TO_CHAR(C.UPD_DATE, 'YYYY-MM-DD HH24:MI:SS'), ' '),
+        U.CUST_NO, U.CUST_NAME, U.BIRTH_DATE, U.SEX_CODE, U.AGE,
+        U.PHONE, U.ADDR, U.GRADE_CODE,
+        P.PROD_CODE, P.PROD_NAME, P.PROD_TYPE, P.INS_PERIOD, P.PAY_PERIOD,
+        P.BASE_PREMIUM, P.INSURED_AMT
+    INTO
+        :h_contract_no, :h_status_code, :h_contract_date, :h_commence_date,
+        :h_maturity_date, :h_pay_cycle, :h_total_premium, :h_main_premium,
+        :h_rider_premium_sum, :h_branch_code, :h_last_pay_date, :h_unpaid_months,
+        :h_note, :h_reg_user, :h_reg_date,
+        :h_upd_user, :h_upd_date,
+        :h_cust_no, :h_cust_name, :h_birth_date, :h_sex_code, :h_age,
+        :h_phone, :h_addr, :h_grade_code,
+        :h_prod_code, :h_prod_name, :h_prod_type, :h_ins_period, :h_pay_period,
+        :h_base_premium, :h_insured_amt
+    FROM   TB_INS_CONTRACT C
+    INNER JOIN TB_INS_CUSTOMER U ON C.CUST_NO = U.CUST_NO
+    INNER JOIN TB_INS_PRODUCT  P ON C.PROD_CODE = P.PROD_CODE
+    WHERE  C.CONTRACT_NO = :h_contract_no
+    FOR UPDATE OF C.STATUS_CODE NOWAIT;
+
+    if (sqlca.sqlcode == 1403) {
+        return ERR_NOT_FOUND;
+    }
+    if (sqlca.sqlcode != 0) {
+        if (sqlca.sqlcode == -54) {  /* ORA-00054: resource busy */
+            LOG_ERROR(ERR_CONTRACT_LOCKED, "Contract is locked by another session");
+            return ERR_CONTRACT_LOCKED;
+        }
+        CHECK_DB_ERROR(sqlca, "select contract");
+    }
+
+    /* 호스트 변수 -> 구조체 복사 */
+    SAFE_STRCPY(info->contract_no, h_contract_no, sizeof(info->contract_no));
+    SAFE_STRCPY(info->status_code, h_status_code, sizeof(info->status_code));
+    SAFE_STRCPY(info->contract_date, h_contract_date, sizeof(info->contract_date));
+    SAFE_STRCPY(info->commence_date, h_commence_date, sizeof(info->commence_date));
+    SAFE_STRCPY(info->maturity_date, h_maturity_date, sizeof(info->maturity_date));
+    SAFE_STRCPY(info->pay_cycle, h_pay_cycle, sizeof(info->pay_cycle));
+    info->total_premium = h_total_premium;
+    info->main_premium = h_main_premium;
+    info->rider_premium_sum = h_rider_premium_sum;
+    SAFE_STRCPY(info->branch_code, h_branch_code, sizeof(info->branch_code));
+    SAFE_STRCPY(info->last_pay_date, h_last_pay_date, sizeof(info->last_pay_date));
+    info->unpaid_months = h_unpaid_months;
+    SAFE_STRCPY(info->note, h_note, sizeof(info->note));
+    SAFE_STRCPY(info->reg_user, h_reg_user, sizeof(info->reg_user));
+    SAFE_STRCPY(info->reg_date, h_reg_date, sizeof(info->reg_date));
+    SAFE_STRCPY(info->upd_user, h_upd_user, sizeof(info->upd_user));
+    SAFE_STRCPY(info->upd_date, h_upd_date, sizeof(info->upd_date));
+    /* 고객정보 */
+    SAFE_STRCPY(info->customer.cust_no, h_cust_no, sizeof(info->customer.cust_no));
+    SAFE_STRCPY(info->customer.cust_name, h_cust_name, sizeof(info->customer.cust_name));
+    SAFE_STRCPY(info->customer.birth_date, h_birth_date, sizeof(info->customer.birth_date));
+    info->customer.sex_code = h_sex_code[0];
+    info->customer.age = h_age;
+    SAFE_STRCPY(info->customer.phone, h_phone, sizeof(info->customer.phone));
+    SAFE_STRCPY(info->customer.addr, h_addr, sizeof(info->customer.addr));
+    SAFE_STRCPY(info->customer.grade_code, h_grade_code, sizeof(info->customer.grade_code));
+    /* 상품정보 */
+    SAFE_STRCPY(info->product.prod_code, h_prod_code, sizeof(info->product.prod_code));
+    SAFE_STRCPY(info->product.prod_name, h_prod_name, sizeof(info->product.prod_name));
+    info->product.prod_type = h_prod_type[0];
+    info->product.ins_period = h_ins_period;
+    info->product.pay_period = h_pay_period;
+    info->product.base_premium = h_base_premium;
+    info->product.insured_amt = h_insured_amt;
+
+    /* 특약 로드 */
+    rc = load_riders(contract_no, info->riders, &info->rider_cnt);
+    if (rc != ERR_SUCCESS) {
+        LOG_ERROR(rc, "Failed to load riders");
+        /* 특약 로드 실패해도 계약정보는 반환 */
+    }
+
+    /* 수익자 로드 */
+    rc = load_beneficiaries(contract_no, info->beneficiaries, &info->beneficiary_cnt);
+    if (rc != ERR_SUCCESS) {
+        LOG_ERROR(rc, "Failed to load beneficiaries");
+    }
+
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * ins_insert_contract - 계약 등록
+ *
+ * SAVEPOINT 사용하여 부분 롤백 가능 (2018-02-14 추가)
+ ******************************************************************************/
+int ins_insert_contract(const CONTRACT_INFO *info)
+{
+    PREMIUM_RESULT prem_result;
+    int rc, i;
+    char log_buf[512];
+
+    CHECK_NULL(info);
+
+    /* 중복 체크 */
+    SAFE_STRCPY(h_contract_no, info->contract_no, sizeof(h_contract_no));
+    EXEC SQL SELECT COUNT(*) INTO :h_count
+        FROM TB_INS_CONTRACT WHERE CONTRACT_NO = :h_contract_no;
+
+    if (h_count > 0) {
+        LOG_ERROR(ERR_DUPLICATE, "Contract already exists");
+        return ERR_DUPLICATE;
+    }
+
+    /* SAVEPOINT 설정 */
+    EXEC SQL SAVEPOINT sp_insert_contract;
+
+    /* 보험료 재계산 */
+    rc = calc_premium(info, &prem_result);
+    if (rc != ERR_SUCCESS) {
+        sprintf(log_buf, "Premium calculation failed for contract %s, rc=%d", info->contract_no, rc);
+        write_batch_log(log_buf);
+        EXEC SQL ROLLBACK TO SAVEPOINT sp_insert_contract;
+        return rc;
+    }
+
+    /* 계약 마스터 INSERT */
+    SAFE_STRCPY(h_contract_no, info->contract_no, sizeof(h_contract_no));
+    SAFE_STRCPY(h_cust_no, info->customer.cust_no, sizeof(h_cust_no));
+    SAFE_STRCPY(h_prod_code, info->product.prod_code, sizeof(h_prod_code));
+    SAFE_STRCPY(h_status_code, STATUS_NORMAL, sizeof(h_status_code));
+    SAFE_STRCPY(h_contract_date, info->contract_date, sizeof(h_contract_date));
+    SAFE_STRCPY(h_commence_date, info->commence_date, sizeof(h_commence_date));
+    SAFE_STRCPY(h_maturity_date, info->maturity_date, sizeof(h_maturity_date));
+    SAFE_STRCPY(h_pay_cycle, info->pay_cycle, sizeof(h_pay_cycle));
+    h_total_premium = prem_result.total_premium;
+    h_main_premium = prem_result.main_premium;
+    h_rider_premium_sum = prem_result.total_rider_premium;
+    SAFE_STRCPY(h_branch_code, info->branch_code, sizeof(h_branch_code));
+    h_unpaid_months = 0;
+    SAFE_STRCPY(h_note, info->note, sizeof(h_note));
+    SAFE_STRCPY(h_reg_user, g_user_id, sizeof(h_reg_user));
+
+    EXEC SQL INSERT INTO TB_INS_CONTRACT (
+        CONTRACT_NO, CUST_NO, PROD_CODE, STATUS_CODE,
+        CONTRACT_DATE, COMMENCE_DATE, MATURITY_DATE, PAY_CYCLE,
+        TOTAL_PREMIUM, MAIN_PREMIUM, RIDER_PREMIUM_SUM,
+        BRANCH_CODE, UNPAID_MONTHS, NOTE,
+        REG_USER, REG_DATE
+    ) VALUES (
+        :h_contract_no, :h_cust_no, :h_prod_code, :h_status_code,
+        TO_DATE(:h_contract_date, 'YYYY-MM-DD'),
+        TO_DATE(:h_commence_date, 'YYYY-MM-DD'),
+        TO_DATE(:h_maturity_date, 'YYYY-MM-DD'),
+        :h_pay_cycle,
+        :h_total_premium, :h_main_premium, :h_rider_premium_sum,
+        :h_branch_code, :h_unpaid_months, :h_note,
+        :h_reg_user, SYSDATE
+    );
+
+    if (sqlca.sqlcode != 0) {
+        LOG_ERROR(ERR_DB_INSERT, "Failed to insert contract master");
+        EXEC SQL ROLLBACK TO SAVEPOINT sp_insert_contract;
+        return ERR_DB_INSERT;
+    }
+
+    /* 특약 INSERT */
+    EXEC SQL SAVEPOINT sp_insert_riders;
+
+    for (i = 0; i < info->rider_cnt; i++) {
+        SAFE_STRCPY(h_rider_code, info->riders[i].rider_code, sizeof(h_rider_code));
+        SAFE_STRCPY(h_rider_name, info->riders[i].rider_name, sizeof(h_rider_name));
+        h_rider_premium = prem_result.rider_premiums[i];
+        h_rider_amt = info->riders[i].rider_amt;
+        h_rider_type[0] = info->riders[i].rider_type;
+        h_rider_type[1] = '\0';
+
+        EXEC SQL INSERT INTO TB_INS_RIDER (
+            CONTRACT_NO, RIDER_CODE, RIDER_NAME,
+            RIDER_PREMIUM, RIDER_AMT, RIDER_TYPE, USE_YN,
+            REG_USER, REG_DATE
+        ) VALUES (
+            :h_contract_no, :h_rider_code, :h_rider_name,
+            :h_rider_premium, :h_rider_amt, :h_rider_type, 'Y',
+            :h_reg_user, SYSDATE
+        );
+
+        if (sqlca.sqlcode != 0) {
+            sprintf(log_buf, "Failed to insert rider %s for contract %s", h_rider_code, h_contract_no);
+            write_batch_log(log_buf);
+            EXEC SQL ROLLBACK TO SAVEPOINT sp_insert_riders;
+            EXEC SQL ROLLBACK TO SAVEPOINT sp_insert_contract;
+            return ERR_DB_INSERT;
+        }
+    }
+
+    /* 수익자 INSERT */
+    for (i = 0; i < info->beneficiary_cnt; i++) {
+        SAFE_STRCPY(h_benef_name, info->beneficiaries[i].benef_name, sizeof(h_benef_name));
+        SAFE_STRCPY(h_benef_rel, info->beneficiaries[i].benef_rel, sizeof(h_benef_rel));
+        h_benef_ratio = info->beneficiaries[i].benef_ratio;
+        h_benef_type[0] = info->beneficiaries[i].benef_type;
+        h_benef_type[1] = '\0';
+
+        EXEC SQL INSERT INTO TB_INS_BENEFICIARY (
+            CONTRACT_NO, BENEF_NAME, BENEF_REL, BENEF_RATIO, BENEF_TYPE,
+            REG_USER, REG_DATE
+        ) VALUES (
+            :h_contract_no, :h_benef_name, :h_benef_rel, :h_benef_ratio, :h_benef_type,
+            :h_reg_user, SYSDATE
+        );
+
+        if (sqlca.sqlcode != 0) {
+            LOG_ERROR(ERR_DB_INSERT, "Failed to insert beneficiary");
+            EXEC SQL ROLLBACK TO SAVEPOINT sp_insert_contract;
+            return ERR_DB_INSERT;
+        }
+    }
+
+    /* 배치모드가 아닌 경우 즉시 커밋 */
+    if (!g_batch_mode) {
+        EXEC SQL COMMIT;
+        if (sqlca.sqlcode != 0) {
+            LOG_ERROR(ERR_DB_COMMIT, "Commit failed after insert");
+            return ERR_DB_COMMIT;
+        }
+    }
+
+    sprintf(log_buf, "Contract %s inserted successfully. Premium=%.0f", info->contract_no, prem_result.total_premium);
+    write_batch_log(log_buf);
+
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * ins_update_contract - 계약 변경 (전체 필드)
+ ******************************************************************************/
+int ins_update_contract(const CONTRACT_INFO *info)
+{
+    PREMIUM_RESULT prem_result;
+    int rc;
+
+    CHECK_NULL(info);
+
+    /* 보험료 재계산 */
+    rc = calc_premium(info, &prem_result);
+    if (rc != ERR_SUCCESS) {
+        LOG_ERROR(rc, "Premium recalculation failed");
+        return rc;
+    }
+
+    SAFE_STRCPY(h_contract_no, info->contract_no, sizeof(h_contract_no));
+    SAFE_STRCPY(h_pay_cycle, info->pay_cycle, sizeof(h_pay_cycle));
+    h_total_premium = prem_result.total_premium;
+    h_main_premium = prem_result.main_premium;
+    h_rider_premium_sum = prem_result.total_rider_premium;
+    SAFE_STRCPY(h_note, info->note, sizeof(h_note));
+    SAFE_STRCPY(h_upd_user, g_user_id, sizeof(h_upd_user));
+
+    EXEC SQL UPDATE TB_INS_CONTRACT
+    SET    PAY_CYCLE        = :h_pay_cycle,
+           TOTAL_PREMIUM    = :h_total_premium,
+           MAIN_PREMIUM     = :h_main_premium,
+           RIDER_PREMIUM_SUM = :h_rider_premium_sum,
+           NOTE             = :h_note,
+           UPD_USER         = :h_upd_user,
+           UPD_DATE         = SYSDATE
+    WHERE  CONTRACT_NO      = :h_contract_no;
+
+    if (sqlca.sqlcode != 0) {
+        LOG_ERROR(ERR_DB_UPDATE, "Failed to update contract");
+        return ERR_DB_UPDATE;
+    }
+    if (sqlca.sqlerrd[2] == 0) {
+        return ERR_NOT_FOUND;
+    }
+
+    if (!g_batch_mode) {
+        EXEC SQL COMMIT;
+    }
+
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * ins_update_status - 계약 상태 변경
+ *
+ * 상태 전이 규칙:
+ *   정상(01) -> 실효(02), 해약(03), 만기(04), 취소(05)
+ *   실효(02) -> 부활(07), 해약(03)
+ *   보류(06) -> 정상(01), 취소(05)
+ ******************************************************************************/
+int ins_update_status(const char *contract_no, const char *new_status, const char *user_id)
+{
+    char cur_status[3];
+    int  valid = 0;
+    char log_buf[256];
+
+    CHECK_NULL(contract_no);
+    CHECK_NULL(new_status);
+
+    SAFE_STRCPY(h_contract_no, contract_no, sizeof(h_contract_no));
+
+    /* 현재 상태 조회 */
+    EXEC SQL SELECT STATUS_CODE INTO :h_status_code
+        FROM TB_INS_CONTRACT
+        WHERE CONTRACT_NO = :h_contract_no
+        FOR UPDATE NOWAIT;
+
+    if (sqlca.sqlcode == 1403) return ERR_NOT_FOUND;
+    if (sqlca.sqlcode == -54) return ERR_CONTRACT_LOCKED;
+    if (sqlca.sqlcode != 0) return ERR_DB_SELECT;
+
+    SAFE_STRCPY(cur_status, h_status_code, sizeof(cur_status));
+
+    /* 상태 전이 규칙 검증 */
+    if (strcmp(cur_status, STATUS_NORMAL) == 0) {
+        if (strcmp(new_status, STATUS_LAPSE) == 0 ||
+            strcmp(new_status, STATUS_SURRENDER) == 0 ||
+            strcmp(new_status, STATUS_MATURITY) == 0 ||
+            strcmp(new_status, STATUS_CANCEL) == 0) {
+            valid = 1;
+        }
+    } else if (strcmp(cur_status, STATUS_LAPSE) == 0) {
+        if (strcmp(new_status, STATUS_REINSTATE) == 0 ||
+            strcmp(new_status, STATUS_SURRENDER) == 0) {
+            valid = 1;
+        }
+    } else if (strcmp(cur_status, STATUS_PENDING) == 0) {
+        if (strcmp(new_status, STATUS_NORMAL) == 0 ||
+            strcmp(new_status, STATUS_CANCEL) == 0) {
+            valid = 1;
+        }
+    }
+    /* 2020-03-01 임시 - 테스트용 상태전이 허용 */
+    /* valid = 1; */
+
+    if (!valid) {
+        sprintf(log_buf, "Invalid status transition: %s -> %s (contract: %s)", cur_status, new_status, contract_no);
+        LOG_ERROR(ERR_INVALID_STATUS, log_buf);
+        EXEC SQL ROLLBACK;
+        return ERR_INVALID_STATUS;
+    }
+
+    /* 상태 업데이트 */
+    SAFE_STRCPY(h_status_code, new_status, sizeof(h_status_code));
+    SAFE_STRCPY(h_upd_user, user_id ? user_id : g_user_id, sizeof(h_upd_user));
+
+    EXEC SQL UPDATE TB_INS_CONTRACT
+    SET    STATUS_CODE = :h_status_code,
+           UPD_USER    = :h_upd_user,
+           UPD_DATE    = SYSDATE
+    WHERE  CONTRACT_NO = :h_contract_no;
+
+    if (sqlca.sqlcode != 0) {
+        EXEC SQL ROLLBACK;
+        return ERR_DB_UPDATE;
+    }
+
+    /* 이력 테이블에 상태변경 기록 */
+    EXEC SQL INSERT INTO TB_INS_STATUS_HIST (
+        CONTRACT_NO, OLD_STATUS, NEW_STATUS, CHG_USER, CHG_DATE
+    ) VALUES (
+        :h_contract_no, :cur_status, :h_status_code, :h_upd_user, SYSDATE
+    );
+
+    /* 이력 INSERT 실패해도 무시 (2018-05-20 요건) */
+    if (sqlca.sqlcode != 0) {
+        char warn_buf[256];
+        sprintf(warn_buf, "Warning: status history insert failed for %s (sqlcode=%ld)", contract_no, sqlca.sqlcode);
+        write_batch_log(warn_buf);
+    }
+
+    if (!g_batch_mode) {
+        EXEC SQL COMMIT;
+    }
+
+    sprintf(log_buf, "Status changed: %s [%s -> %s] by %s", contract_no, cur_status, new_status, h_upd_user);
+    write_batch_log(log_buf);
+
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * ins_search_by_customer - 고객번호로 계약 목록 조회
+ ******************************************************************************/
+int ins_search_by_customer(const char *cust_no, CONTRACT_INFO *list, int *cnt)
+{
+    int idx = 0;
+
+    CHECK_NULL(cust_no);
+    CHECK_NULL(list);
+    CHECK_NULL(cnt);
+
+    SAFE_STRCPY(h_cust_no, cust_no, sizeof(h_cust_no));
+
+    EXEC SQL DECLARE cur_by_cust CURSOR FOR
+        SELECT C.CONTRACT_NO, C.STATUS_CODE, C.CONTRACT_DATE,
+               C.TOTAL_PREMIUM, C.BRANCH_CODE, C.UNPAID_MONTHS,
+               P.PROD_NAME
+        FROM   TB_INS_CONTRACT C
+        INNER JOIN TB_INS_PRODUCT P ON C.PROD_CODE = P.PROD_CODE
+        WHERE  C.CUST_NO = :h_cust_no
+        ORDER BY C.CONTRACT_DATE DESC;
+
+    EXEC SQL OPEN cur_by_cust;
+    if (sqlca.sqlcode != 0) return ERR_DB_SELECT;
+
+    while (idx < MAX_ARRAY_SIZE) {
+        EXEC SQL FETCH cur_by_cust
+            INTO :h_contract_no, :h_status_code, :h_contract_date,
+                 :h_total_premium, :h_branch_code, :h_unpaid_months,
+                 :h_prod_name;
+
+        if (sqlca.sqlcode == 1403) break;
+        if (sqlca.sqlcode != 0) { EXEC SQL CLOSE cur_by_cust; return ERR_DB_SELECT; }
+
+        memset(&list[idx], 0, sizeof(CONTRACT_INFO));
+        SAFE_STRCPY(list[idx].contract_no, h_contract_no, sizeof(list[idx].contract_no));
+        SAFE_STRCPY(list[idx].status_code, h_status_code, sizeof(list[idx].status_code));
+        SAFE_STRCPY(list[idx].contract_date, h_contract_date, sizeof(list[idx].contract_date));
+        list[idx].total_premium = h_total_premium;
+        SAFE_STRCPY(list[idx].branch_code, h_branch_code, sizeof(list[idx].branch_code));
+        list[idx].unpaid_months = h_unpaid_months;
+        SAFE_STRCPY(list[idx].product.prod_name, h_prod_name, sizeof(list[idx].product.prod_name));
+        idx++;
+    }
+
+    EXEC SQL CLOSE cur_by_cust;
+    *cnt = idx;
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * ins_search_by_branch - 지점별 기간 조회 (2022-03-10 추가)
+ ******************************************************************************/
+int ins_search_by_branch(const char *branch_code, const char *from_date, const char *to_date, CONTRACT_INFO *list, int *cnt)
+{
+    int idx = 0;
+
+    CHECK_NULL(branch_code);
+    CHECK_NULL(list);
+    CHECK_NULL(cnt);
+
+    SAFE_STRCPY(h_branch_code, branch_code, sizeof(h_branch_code));
+    SAFE_STRCPY(h_from_date, from_date ? from_date : "2000-01-01", sizeof(h_from_date));
+    SAFE_STRCPY(h_to_date, to_date ? to_date : "2099-12-31", sizeof(h_to_date));
+
+    EXEC SQL DECLARE cur_by_branch CURSOR FOR
+        SELECT C.CONTRACT_NO, C.STATUS_CODE, C.CONTRACT_DATE,
+               C.TOTAL_PREMIUM, C.BRANCH_CODE, C.UNPAID_MONTHS,
+               U.CUST_NAME, P.PROD_NAME
+        FROM   TB_INS_CONTRACT C
+        INNER JOIN TB_INS_CUSTOMER U ON C.CUST_NO = U.CUST_NO
+        INNER JOIN TB_INS_PRODUCT P  ON C.PROD_CODE = P.PROD_CODE
+        WHERE  C.BRANCH_CODE = :h_branch_code
+        AND    C.CONTRACT_DATE BETWEEN TO_DATE(:h_from_date, 'YYYY-MM-DD') AND TO_DATE(:h_to_date, 'YYYY-MM-DD')
+        ORDER BY C.CONTRACT_DATE DESC;
+
+    EXEC SQL OPEN cur_by_branch;
+    if (sqlca.sqlcode != 0) return ERR_DB_SELECT;
+
+    while (idx < MAX_ARRAY_SIZE) {
+        EXEC SQL FETCH cur_by_branch
+            INTO :h_contract_no, :h_status_code, :h_contract_date,
+                 :h_total_premium, :h_branch_code, :h_unpaid_months,
+                 :h_cust_name, :h_prod_name;
+
+        if (sqlca.sqlcode == 1403) break;
+        if (sqlca.sqlcode != 0) { EXEC SQL CLOSE cur_by_branch; return ERR_DB_SELECT; }
+
+        memset(&list[idx], 0, sizeof(CONTRACT_INFO));
+        SAFE_STRCPY(list[idx].contract_no, h_contract_no, sizeof(list[idx].contract_no));
+        SAFE_STRCPY(list[idx].status_code, h_status_code, sizeof(list[idx].status_code));
+        SAFE_STRCPY(list[idx].contract_date, h_contract_date, sizeof(list[idx].contract_date));
+        list[idx].total_premium = h_total_premium;
+        SAFE_STRCPY(list[idx].branch_code, h_branch_code, sizeof(list[idx].branch_code));
+        list[idx].unpaid_months = h_unpaid_months;
+        SAFE_STRCPY(list[idx].customer.cust_name, h_cust_name, sizeof(list[idx].customer.cust_name));
+        SAFE_STRCPY(list[idx].product.prod_name, h_prod_name, sizeof(list[idx].product.prod_name));
+        idx++;
+    }
+
+    EXEC SQL CLOSE cur_by_branch;
+    *cnt = idx;
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * ins_batch_lapse_check - 실효 배치 처리
+ *
+ * 미납 2개월 이상인 정상계약을 실효 처리
+ * COMMIT_UNIT 단위로 커밋 (2020-09-01 수정)
+ ******************************************************************************/
+int ins_batch_lapse_check(const char *base_date, int *processed_cnt)
+{
+    int total = 0, success = 0, fail = 0;
+    int rc;
+    char log_buf[512];
+
+    CHECK_NULL(base_date);
+    CHECK_NULL(processed_cnt);
+
+    g_batch_mode = 1;
+    *processed_cnt = 0;
+
+    SAFE_STRCPY(h_base_date, base_date, sizeof(h_base_date));
+
+    sprintf(log_buf, "=== Lapse batch started. Base date: %s ===", base_date);
+    write_batch_log(log_buf);
+
+    /* 미납 2개월 이상 정상계약 커서 */
+    EXEC SQL DECLARE cur_lapse CURSOR FOR
+        SELECT CONTRACT_NO, UNPAID_MONTHS
+        FROM   TB_INS_CONTRACT
+        WHERE  STATUS_CODE = '01'
+        AND    UNPAID_MONTHS >= 2
+        AND    COMMENCE_DATE <= TO_DATE(:h_base_date, 'YYYY-MM-DD') - 60
+        ORDER BY CONTRACT_NO
+        FOR UPDATE OF STATUS_CODE;
+
+    EXEC SQL OPEN cur_lapse;
+    if (sqlca.sqlcode != 0) {
+        LOG_ERROR(ERR_DB_SELECT, "Failed to open lapse cursor");
+        g_batch_mode = 0;
+        return ERR_DB_SELECT;
+    }
+
+    while (1) {
+        EXEC SQL FETCH cur_lapse INTO :h_contract_no, :h_unpaid_months;
+
+        if (sqlca.sqlcode == 1403) break;
+        if (sqlca.sqlcode != 0) {
+            sprintf(log_buf, "Fetch error in lapse cursor: sqlcode=%ld", sqlca.sqlcode);
+            write_batch_log(log_buf);
+            break;
+        }
+
+        total++;
+
+        /* 상태 변경 (실효) */
+        rc = ins_update_status(h_contract_no, STATUS_LAPSE, "BATCH_LAPSE");
+        if (rc == ERR_SUCCESS) {
+            success++;
+        } else {
+            fail++;
+            sprintf(log_buf, "Lapse failed: contract=%s, rc=%d", h_contract_no, rc);
+            write_batch_log(log_buf);
+        }
+
+        /* COMMIT_UNIT 단위 커밋 */
+        g_commit_count++;
+        if (g_commit_count >= COMMIT_UNIT) {
+            EXEC SQL COMMIT;
+            if (sqlca.sqlcode != 0) {
+                LOG_ERROR(ERR_DB_COMMIT, "Batch commit failed");
+                break;
+            }
+            g_commit_count = 0;
+            sprintf(log_buf, "Batch commit at %d records", total);
+            write_batch_log(log_buf);
+        }
+    }
+
+    /* 잔여 건 커밋 */
+    if (g_commit_count > 0) {
+        EXEC SQL COMMIT;
+        g_commit_count = 0;
+    }
+
+    EXEC SQL CLOSE cur_lapse;
+
+    *processed_cnt = success;
+    sprintf(log_buf, "=== Lapse batch completed. Total=%d, Success=%d, Fail=%d ===", total, success, fail);
+    write_batch_log(log_buf);
+
+    g_batch_mode = 0;
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * ins_delete_contract - 계약 삭제 (취소 상태만 가능)
+ ******************************************************************************/
+int ins_delete_contract(const char *contract_no)
+{
+    CHECK_NULL(contract_no);
+
+    SAFE_STRCPY(h_contract_no, contract_no, sizeof(h_contract_no));
+
+    /* 상태 확인 - 취소건만 삭제 가능 */
+    EXEC SQL SELECT STATUS_CODE INTO :h_status_code
+        FROM TB_INS_CONTRACT WHERE CONTRACT_NO = :h_contract_no;
+
+    if (sqlca.sqlcode == 1403) return ERR_NOT_FOUND;
+    if (sqlca.sqlcode != 0) return ERR_DB_SELECT;
+
+    if (strcmp(h_status_code, STATUS_CANCEL) != 0) {
+        LOG_ERROR(ERR_INVALID_STATUS, "Only cancelled contracts can be deleted");
+        return ERR_INVALID_STATUS;
+    }
+
+    EXEC SQL SAVEPOINT sp_delete;
+
+    /* 수익자 삭제 */
+    EXEC SQL DELETE FROM TB_INS_BENEFICIARY WHERE CONTRACT_NO = :h_contract_no;
+    /* 특약 삭제 */
+    EXEC SQL DELETE FROM TB_INS_RIDER WHERE CONTRACT_NO = :h_contract_no;
+    /* 이력 삭제 */
+    EXEC SQL DELETE FROM TB_INS_STATUS_HIST WHERE CONTRACT_NO = :h_contract_no;
+    /* 마스터 삭제 */
+    EXEC SQL DELETE FROM TB_INS_CONTRACT WHERE CONTRACT_NO = :h_contract_no;
+
+    if (sqlca.sqlcode != 0) {
+        EXEC SQL ROLLBACK TO SAVEPOINT sp_delete;
+        return ERR_DB_DELETE;
+    }
+
+    EXEC SQL COMMIT;
+    return ERR_SUCCESS;
+}
+
+/*******************************************************************************
+ * print_contract_info - 계약정보 출력 (디버그/조회용)
+ ******************************************************************************/
+static void print_contract_info(const CONTRACT_INFO *info)
+{
+    char amt_buf[MAX_AMT_STR];
+    int i;
+
+    printf("============================================================\n");
+    printf(" 계약번호  : %s\n", info->contract_no);
+    printf(" 계약상태  : %s\n", info->status_code);
+    printf(" 계약일자  : %s\n", info->contract_date);
+    printf(" 개시일자  : %s\n", info->commence_date);
+    printf(" 만기일자  : %s\n", info->maturity_date);
+    printf("------------------------------------------------------------\n");
+    printf(" 고객번호  : %s\n", info->customer.cust_no);
+    printf(" 고객명    : %s\n", info->customer.cust_name);
+    printf(" 생년월일  : %s (만%d세)\n", info->customer.birth_date, info->customer.age);
+    printf(" 성별      : %c\n", info->customer.sex_code);
+    printf(" 건강등급  : %s\n", info->customer.grade_code);
+    printf("------------------------------------------------------------\n");
+    printf(" 상품코드  : %s\n", info->product.prod_code);
+    printf(" 상품명    : %s\n", info->product.prod_name);
+    printf(" 보험기간  : %d년\n", info->product.ins_period);
+    printf(" 납입기간  : %d년\n", info->product.pay_period);
+    format_amount(info->product.insured_amt, amt_buf, sizeof(amt_buf));
+    printf(" 가입금액  : %s원\n", amt_buf);
+    printf("------------------------------------------------------------\n");
+    format_amount(info->main_premium, amt_buf, sizeof(amt_buf));
+    printf(" 주계약료  : %s원\n", amt_buf);
+    format_amount(info->rider_premium_sum, amt_buf, sizeof(amt_buf));
+    printf(" 특약료합  : %s원\n", amt_buf);
+    format_amount(info->total_premium, amt_buf, sizeof(amt_buf));
+    printf(" 총보험료  : %s원\n", amt_buf);
+    printf(" 납입주기  : %s\n", info->pay_cycle);
+    printf("------------------------------------------------------------\n");
+
+    if (info->rider_cnt > 0) {
+        printf(" [특약 목록] (%d건)\n", info->rider_cnt);
+        for (i = 0; i < info->rider_cnt; i++) {
+            format_amount(info->riders[i].rider_premium, amt_buf, sizeof(amt_buf));
+            printf("   %d. [%s] %s - %s원\n", i + 1, info->riders[i].rider_code, info->riders[i].rider_name, amt_buf);
+        }
+    }
+
+    if (info->beneficiary_cnt > 0) {
+        printf(" [수익자 목록] (%d건)\n", info->beneficiary_cnt);
+        for (i = 0; i < info->beneficiary_cnt; i++) {
+            printf("   %d. %s (%s) %.0f%%\n", i + 1, info->beneficiaries[i].benef_name, info->beneficiaries[i].benef_rel, info->beneficiaries[i].benef_ratio * 100);
+        }
+    }
+
+    printf("============================================================\n");
+}
+
+/*******************************************************************************
+ * main - 메인 함수
+ *
+ * Usage: contract_main [options]
+ *   -q <contract_no>  : 계약 조회
+ *   -c <cust_no>      : 고객별 계약 조회
+ *   -b <branch> <from> <to> : 지점별 기간 조회
+ *   -l <base_date>    : 실효 배치 처리
+ *   -u <user_id>      : 사용자 ID 설정
+ ******************************************************************************/
+int main(int argc, char *argv[])
+{
+    CONTRACT_INFO info;
+    CONTRACT_INFO list[MAX_ARRAY_SIZE];
+    int cnt = 0, rc = 0, i;
+    char log_path[256];
+    char *db_user = "INS_USER";
+    char *db_pass = "INS_PASS";
+    char *db_name = "INSDB";
+
+    get_current_date(g_today, sizeof(g_today));
+
+    /* 로그 파일 열기 */
+    sprintf(log_path, "/app/ins/log/contract_%s.log", g_today);
+    g_logfp = fopen(log_path, "a");
+    /* 파일 열기 실패해도 계속 진행 (stdout으로 출력) */
+
+    /* DB 접속 */
+    rc = db_connect(db_user, db_pass, db_name);
+    if (rc != ERR_SUCCESS) {
+        fprintf(stderr, "Database connection failed. rc=%d\n", rc);
+        return 1;
+    }
+
+    if (argc < 2) {
+        printf("Usage: %s [-q contract_no] [-c cust_no] [-b branch from to] [-l base_date] [-u user_id]\n", argv[0]);
+        db_disconnect();
+        return 0;
+    }
+
+    /* 사용자 ID 설정 */
+    for (i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "-u") == 0) {
+            SAFE_STRCPY(g_user_id, argv[i + 1], sizeof(g_user_id));
+        }
+    }
+
+    /* 명령 처리 */
+    i = 1;
+    while (i < argc) {
+        if (strcmp(argv[i], "-q") == 0 && i + 1 < argc) {
+            /* 계약 조회 */
+            rc = ins_select_contract(argv[i + 1], &info);
+            if (rc == ERR_SUCCESS) {
+                print_contract_info(&info);
+            } else if (rc == ERR_NOT_FOUND) {
+                printf("Contract not found: %s\n", argv[i + 1]);
+            } else {
+                printf("Select error: rc=%d\n", rc);
+            }
+            EXEC SQL ROLLBACK;  /* FOR UPDATE 해제 */
+            i += 2;
+        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            /* 고객별 조회 */
+            rc = ins_search_by_customer(argv[i + 1], list, &cnt);
+            if (rc == ERR_SUCCESS) {
+                printf("Found %d contracts for customer %s\n", cnt, argv[i + 1]);
+                for (int j = 0; j < cnt; j++) {
+                    char amt_buf[MAX_AMT_STR];
+                    format_amount(list[j].total_premium, amt_buf, sizeof(amt_buf));
+                    printf("  %d. [%s] %s status=%s premium=%s unpaid=%d months\n", j + 1, list[j].contract_no, list[j].product.prod_name, list[j].status_code, amt_buf, list[j].unpaid_months);
+                }
+            }
+            i += 2;
+        } else if (strcmp(argv[i], "-b") == 0 && i + 3 < argc) {
+            /* 지점별 기간 조회 */
+            rc = ins_search_by_branch(argv[i + 1], argv[i + 2], argv[i + 3], list, &cnt);
+            if (rc == ERR_SUCCESS) {
+                printf("Found %d contracts for branch %s (%s ~ %s)\n", cnt, argv[i + 1], argv[i + 2], argv[i + 3]);
+                for (int j = 0; j < cnt; j++) {
+                    char amt_buf[MAX_AMT_STR];
+                    format_amount(list[j].total_premium, amt_buf, sizeof(amt_buf));
+                    printf("  %d. [%s] %s / %s status=%s premium=%s\n", j + 1, list[j].contract_no, list[j].customer.cust_name, list[j].product.prod_name, list[j].status_code, amt_buf);
+                }
+            }
+            i += 4;
+        } else if (strcmp(argv[i], "-l") == 0 && i + 1 < argc) {
+            /* 실효 배치 */
+            rc = ins_batch_lapse_check(argv[i + 1], &cnt);
+            printf("Lapse batch result: rc=%d, processed=%d\n", rc, cnt);
+            i += 2;
+        } else if (strcmp(argv[i], "-u") == 0) {
+            i += 2;  /* 이미 처리됨 */
+        } else {
+            printf("Unknown option: %s\n", argv[i]);
+            i++;
+        }
+    }
+
+    db_disconnect();
+
+    if (g_logfp != NULL) {
+        fclose(g_logfp);
+    }
+
+    return 0;
+}

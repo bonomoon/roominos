@@ -1,0 +1,612 @@
+/*******************************************************************************
+ * pay_main.pc - 급여 배치 메인 프로그램
+ *
+ * 작성일: 2006-05-20
+ * 수정일: 2013-01-10  최과장 - 커밋 단위 조정
+ * 수정일: 2018-11-20  김대리 - 확정 처리 추가
+ * 수정일: 2020-07-01  박사원 - 일용직 처리 로직
+ * 수정일: 2023-01-02  이대리 - 함수포인터 기반 세금계산 리팩토링
+ *
+ * 급여 배치 처리 메인
+ * - 사원 커서 -> 수당 로드 -> 세금 계산 -> 공제 처리 -> 저장
+ * Oracle Pro*C precompiler 필요
+ ******************************************************************************/
+
+#include "pay_common.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    char    h_emp_no[MAX_EMP_NO];
+    char    h_emp_name[MAX_EMP_NAME];
+    char    h_dept_code[MAX_DEPT_CODE];
+    char    h_dept_name[MAX_DEPT_NAME];
+    char    h_position[MAX_POSITION];
+    char    h_hire_date[MAX_DATE_LEN];
+    char    h_resign_date[MAX_DATE_LEN];
+    int     h_family_cnt;
+    int     h_child_cnt;
+    double  h_base_salary;
+    double  h_position_pay;
+    char    h_tax_type[2];
+    char    h_union_yn[2];
+    double  h_union_rate;
+    double  h_loan_deduct;
+    char    h_active_yn[2];
+    char    h_pay_ym[MAX_YYYYMM];
+    char    h_status[2];
+    int     h_count;
+    double  h_amount;
+    /* DB 접속 */
+    char    h_db_user[50];
+    char    h_db_pass[50];
+    char    h_db_name[50];
+EXEC SQL END DECLARE SECTION;
+
+/* 전역 변수 */
+static int  g_connected = 0;
+static int  g_commit_count = 0;
+static FILE *g_logfp = NULL;
+static char g_process_date[MAX_DATE_LEN];
+
+/* 세금 계산 함수 포인터 (2023-01-02 리팩토링) */
+static tax_calc_func_t g_tax_func = tax_calc_income_tax;
+
+/* 2020-07-01 일용직 세금 계산 함수 */
+static int tax_calc_daily_worker(double taxable, int family_cnt, double *tax);
+
+/*******************************************************************************
+ * db_connect / db_disconnect
+ ******************************************************************************/
+static int pay_db_connect(const char *user, const char *pass, const char *db)
+{
+    if (g_connected) return PAY_SUCCESS;
+
+    PAY_STRCPY(h_db_user, user, sizeof(h_db_user));
+    PAY_STRCPY(h_db_pass, pass, sizeof(h_db_pass));
+    PAY_STRCPY(h_db_name, db, sizeof(h_db_name));
+
+    EXEC SQL CONNECT :h_db_user IDENTIFIED BY :h_db_pass USING :h_db_name;
+
+    if (sqlca.sqlcode != 0) {
+        PAY_LOG_ERROR("DB connect failed: %.*s", (int)sqlca.sqlerrm.sqlerrml, sqlca.sqlerrm.sqlerrmc);
+        return PAY_ERR_DB;
+    }
+
+    g_connected = 1;
+    PAY_LOG_INFO("Database connected");
+    return PAY_SUCCESS;
+}
+
+static void pay_db_disconnect(void)
+{
+    if (!g_connected) return;
+    EXEC SQL COMMIT WORK RELEASE;
+    g_connected = 0;
+}
+
+/*******************************************************************************
+ * check_already_processed - 이미 처리된 급여년월 확인
+ ******************************************************************************/
+static int check_already_processed(const char *pay_ym)
+{
+    PAY_STRCPY(h_pay_ym, pay_ym, sizeof(h_pay_ym));
+
+    EXEC SQL SELECT COUNT(*) INTO :h_count
+        FROM TB_PAY_MASTER
+        WHERE PAY_YM = :h_pay_ym AND STATUS IN ('C', 'P');
+
+    if (sqlca.sqlcode != 0) return 0;
+    return h_count;
+}
+
+/*******************************************************************************
+ * load_employee - 사원 정보 로드
+ ******************************************************************************/
+static int load_employee(const char *emp_no, EMP_INFO *emp)
+{
+    PAY_STRCPY(h_emp_no, emp_no, sizeof(h_emp_no));
+
+    EXEC SQL SELECT
+        E.EMP_NO, E.EMP_NAME, E.DEPT_CODE, D.DEPT_NAME,
+        E.POSITION, TO_CHAR(E.HIRE_DATE, 'YYYY-MM-DD'),
+        NVL(TO_CHAR(E.RESIGN_DATE, 'YYYY-MM-DD'), ' '),
+        E.FAMILY_CNT, E.CHILD_CNT,
+        E.BASE_SALARY, E.POSITION_PAY,
+        E.TAX_TYPE, E.UNION_YN, NVL(E.UNION_RATE, 0),
+        NVL(E.LOAN_DEDUCT, 0), E.ACTIVE_YN
+    INTO
+        :h_emp_no, :h_emp_name, :h_dept_code, :h_dept_name,
+        :h_position, :h_hire_date,
+        :h_resign_date,
+        :h_family_cnt, :h_child_cnt,
+        :h_base_salary, :h_position_pay,
+        :h_tax_type, :h_union_yn, :h_union_rate,
+        :h_loan_deduct, :h_active_yn
+    FROM TB_PAY_EMPLOYEE E
+    INNER JOIN TB_PAY_DEPT D ON E.DEPT_CODE = D.DEPT_CODE
+    WHERE E.EMP_NO = :h_emp_no;
+
+    if (sqlca.sqlcode == 1403) return PAY_ERR_NOT_FOUND;
+    if (sqlca.sqlcode != 0) return PAY_ERR_DB;
+
+    memset(emp, 0, sizeof(EMP_INFO));
+    PAY_STRCPY(emp->emp_no, h_emp_no, sizeof(emp->emp_no));
+    PAY_STRCPY(emp->emp_name, h_emp_name, sizeof(emp->emp_name));
+    PAY_STRCPY(emp->dept_code, h_dept_code, sizeof(emp->dept_code));
+    PAY_STRCPY(emp->dept_name, h_dept_name, sizeof(emp->dept_name));
+    PAY_STRCPY(emp->position, h_position, sizeof(emp->position));
+    PAY_STRCPY(emp->hire_date, h_hire_date, sizeof(emp->hire_date));
+    PAY_STRCPY(emp->resign_date, h_resign_date, sizeof(emp->resign_date));
+    emp->family_cnt = h_family_cnt;
+    emp->child_cnt = h_child_cnt;
+    emp->base_salary = h_base_salary;
+    emp->position_pay = h_position_pay;
+    emp->tax_type = h_tax_type[0];
+    emp->union_yn = h_union_yn[0];
+    emp->union_rate = h_union_rate;
+    emp->loan_deduct = h_loan_deduct;
+    emp->active_yn = h_active_yn[0];
+
+    return PAY_SUCCESS;
+}
+
+/*******************************************************************************
+ * tax_calc_daily_worker - 일용직 소득세 계산 (2020-07-01 추가)
+ *
+ * 일용직 원천징수: (일급여 - 15만원) * 6% * (1 - 55%)
+ * 월 환산하여 적용
+ ******************************************************************************/
+static int tax_calc_daily_worker(double taxable, int family_cnt, double *tax)
+{
+    double daily_equiv;
+    double daily_tax;
+
+    if (tax == NULL) return PAY_ERR_INVALID;
+    *tax = 0.0;
+
+    if (taxable <= 0) return PAY_SUCCESS;
+
+    /* 월급여를 22일 기준 일급여로 환산 */
+    daily_equiv = taxable / 22.0;
+
+    /* 일 15만원 공제 */
+    daily_equiv -= 150000;
+    if (daily_equiv <= 0) return PAY_SUCCESS;
+
+    /* 6% 원천징수 후 55% 세액공제 */
+    daily_tax = daily_equiv * 0.06 * (1.0 - 0.55);
+
+    /* 월 환산 */
+    *tax = ROUND_10(daily_tax * 22.0);
+
+    return PAY_SUCCESS;
+}
+
+/*******************************************************************************
+ * process_single_employee - 사원 1명 급여 처리
+ ******************************************************************************/
+static int process_single_employee(EMP_INFO *emp, const char *pay_ym, PAY_DETAIL *detail)
+{
+    double overtime_pay = 0, night_pay = 0, holiday_pay = 0;
+    double nontaxable;
+    int rc;
+
+    PAY_CHECK_NULL(emp);
+    PAY_CHECK_NULL(detail);
+
+    memset(detail, 0, sizeof(PAY_DETAIL));
+    PAY_STRCPY(detail->emp_no, emp->emp_no, sizeof(detail->emp_no));
+    PAY_STRCPY(detail->pay_ym, pay_ym, sizeof(detail->pay_ym));
+
+    /* 1. 수당 로드 (pay_detail.pc) */
+    rc = pay_load_allowances(emp->emp_no, pay_ym, detail->allowances, &detail->allow_cnt, &detail->allow_total);
+    if (rc != PAY_SUCCESS && rc != PAY_ERR_NOT_FOUND) {
+        PAY_LOG_ERROR("Load allowances failed: emp=%s rc=%d", emp->emp_no, rc);
+        return rc;
+    }
+
+    /* 기본급/직책수당이 없으면 사원 마스터에서 설정 */
+    if (detail->allow_cnt == 0) {
+        PAY_STRCPY(detail->allowances[0].item_code, ALLOW_BASE_PAY, sizeof(detail->allowances[0].item_code));
+        PAY_STRCPY(detail->allowances[0].item_name, "기본급", sizeof(detail->allowances[0].item_name));
+        detail->allowances[0].amount = emp->base_salary;
+        detail->allowances[0].tax_yn = 'Y';
+        detail->allow_cnt = 1;
+
+        if (emp->position_pay > 0) {
+            PAY_STRCPY(detail->allowances[1].item_code, ALLOW_POSITION_PAY, sizeof(detail->allowances[1].item_code));
+            PAY_STRCPY(detail->allowances[1].item_name, "직책수당", sizeof(detail->allowances[1].item_name));
+            detail->allowances[1].amount = emp->position_pay;
+            detail->allowances[1].tax_yn = 'Y';
+            detail->allow_cnt = 2;
+        }
+
+        detail->allow_total = emp->base_salary + emp->position_pay;
+    }
+
+    /* 2. 시간외수당 계산 (pay_detail.pc) */
+    rc = pay_calc_overtime(emp->emp_no, pay_ym, emp->base_salary, &overtime_pay, &night_pay, &holiday_pay);
+    if (rc == PAY_SUCCESS) {
+        int idx = detail->allow_cnt;
+        if (overtime_pay > 0 && idx < MAX_ALLOW_CNT) {
+            PAY_STRCPY(detail->allowances[idx].item_code, ALLOW_OVERTIME_PAY, sizeof(detail->allowances[idx].item_code));
+            PAY_STRCPY(detail->allowances[idx].item_name, "시간외수당", sizeof(detail->allowances[idx].item_name));
+            detail->allowances[idx].amount = overtime_pay;
+            detail->allowances[idx].tax_yn = 'Y';
+            detail->allow_total += overtime_pay;
+            idx++;
+        }
+        if (night_pay > 0 && idx < MAX_ALLOW_CNT) {
+            PAY_STRCPY(detail->allowances[idx].item_code, ALLOW_NIGHT_PAY, sizeof(detail->allowances[idx].item_code));
+            PAY_STRCPY(detail->allowances[idx].item_name, "야간수당", sizeof(detail->allowances[idx].item_name));
+            detail->allowances[idx].amount = night_pay;
+            detail->allowances[idx].tax_yn = 'Y';
+            detail->allow_total += night_pay;
+            idx++;
+        }
+        if (holiday_pay > 0 && idx < MAX_ALLOW_CNT) {
+            PAY_STRCPY(detail->allowances[idx].item_code, ALLOW_HOLIDAY_PAY, sizeof(detail->allowances[idx].item_code));
+            PAY_STRCPY(detail->allowances[idx].item_name, "휴일수당", sizeof(detail->allowances[idx].item_name));
+            detail->allowances[idx].amount = holiday_pay;
+            detail->allowances[idx].tax_yn = 'Y';
+            detail->allow_total += holiday_pay;
+            idx++;
+        }
+        detail->allow_cnt = idx;
+    }
+
+    /* 3. 비과세 산출 (tax_calc.c) */
+    nontaxable = tax_get_nontaxable(detail->allowances, detail->allow_cnt);
+    detail->nontaxable_total = nontaxable;
+    detail->taxable_total = detail->allow_total - nontaxable;
+    if (detail->taxable_total < 0) detail->taxable_total = 0;
+
+    /* 4. 세금 계산 (tax_calc.c - 함수 포인터 사용) */
+    /* 2023-01-02 리팩토링 - 과세유형별 함수 포인터 분기 */
+    if (emp->tax_type == 'B') {
+        /* 일용직 */
+        g_tax_func = tax_calc_daily_worker;
+    } else {
+        /* 일반, 외국인 */
+        g_tax_func = tax_calc_income_tax;
+    }
+
+    rc = g_tax_func(detail->taxable_total, emp->family_cnt, &detail->income_tax);
+    if (rc != PAY_SUCCESS) {
+        PAY_LOG_ERROR("Tax calc failed: emp=%s rc=%d", emp->emp_no, rc);
+        return PAY_ERR_TAX;
+    }
+
+    /* 주민세 */
+    tax_calc_local_tax(detail->income_tax, &detail->local_tax);
+
+    /* 4대보험 (보수월액 = 기본급 + 직책수당 기준) */
+    double insurance_base = emp->base_salary + emp->position_pay;
+    tax_calc_nps(insurance_base, &detail->nps);
+    tax_calc_nhi(insurance_base, &detail->nhi, &detail->ltc);
+    tax_calc_ei(insurance_base, &detail->ei);
+
+    /* 5. 공제 항목 구성 */
+    detail->deduct_cnt = 0;
+    int didx = 0;
+
+    /* 소득세 */
+    PAY_STRCPY(detail->deductions[didx].item_code, DEDUCT_INCOME_TAX, sizeof(detail->deductions[didx].item_code));
+    PAY_STRCPY(detail->deductions[didx].item_name, "소득세", sizeof(detail->deductions[didx].item_name));
+    detail->deductions[didx].amount = detail->income_tax;
+    didx++;
+
+    /* 주민세 */
+    PAY_STRCPY(detail->deductions[didx].item_code, DEDUCT_LOCAL_TAX, sizeof(detail->deductions[didx].item_code));
+    PAY_STRCPY(detail->deductions[didx].item_name, "주민세", sizeof(detail->deductions[didx].item_name));
+    detail->deductions[didx].amount = detail->local_tax;
+    didx++;
+
+    /* 국민연금 */
+    PAY_STRCPY(detail->deductions[didx].item_code, DEDUCT_NPS, sizeof(detail->deductions[didx].item_code));
+    PAY_STRCPY(detail->deductions[didx].item_name, "국민연금", sizeof(detail->deductions[didx].item_name));
+    detail->deductions[didx].amount = detail->nps;
+    didx++;
+
+    /* 건강보험 */
+    PAY_STRCPY(detail->deductions[didx].item_code, DEDUCT_NHI, sizeof(detail->deductions[didx].item_code));
+    PAY_STRCPY(detail->deductions[didx].item_name, "건강보험", sizeof(detail->deductions[didx].item_name));
+    detail->deductions[didx].amount = detail->nhi;
+    didx++;
+
+    /* 장기요양 */
+    PAY_STRCPY(detail->deductions[didx].item_code, DEDUCT_LTC, sizeof(detail->deductions[didx].item_code));
+    PAY_STRCPY(detail->deductions[didx].item_name, "장기요양", sizeof(detail->deductions[didx].item_name));
+    detail->deductions[didx].amount = detail->ltc;
+    didx++;
+
+    /* 고용보험 */
+    PAY_STRCPY(detail->deductions[didx].item_code, DEDUCT_EI, sizeof(detail->deductions[didx].item_code));
+    PAY_STRCPY(detail->deductions[didx].item_name, "고용보험", sizeof(detail->deductions[didx].item_name));
+    detail->deductions[didx].amount = detail->ei;
+    didx++;
+
+    /* 조합비 */
+    if (emp->union_yn == 'Y' && emp->union_rate > 0) {
+        PAY_STRCPY(detail->deductions[didx].item_code, DEDUCT_UNION, sizeof(detail->deductions[didx].item_code));
+        PAY_STRCPY(detail->deductions[didx].item_name, "조합비", sizeof(detail->deductions[didx].item_name));
+        detail->deductions[didx].amount = ROUND_10(emp->base_salary * emp->union_rate);
+        didx++;
+    }
+
+    /* 대출상환 */
+    if (emp->loan_deduct > 0) {
+        PAY_STRCPY(detail->deductions[didx].item_code, DEDUCT_LOAN, sizeof(detail->deductions[didx].item_code));
+        PAY_STRCPY(detail->deductions[didx].item_name, "대출상환", sizeof(detail->deductions[didx].item_name));
+        detail->deductions[didx].amount = emp->loan_deduct;
+        didx++;
+    }
+
+    /* 기타 공제 로드 (pay_detail.pc) */
+    {
+        PAY_ITEM extra_deducts[MAX_DEDUCT_CNT];
+        int extra_cnt = 0;
+        double extra_total = 0;
+        rc = pay_load_deductions(emp->emp_no, pay_ym, extra_deducts, &extra_cnt, &extra_total);
+        if (rc == PAY_SUCCESS && extra_cnt > 0) {
+            int k;
+            for (k = 0; k < extra_cnt && didx < MAX_DEDUCT_CNT; k++) {
+                memcpy(&detail->deductions[didx], &extra_deducts[k], sizeof(PAY_ITEM));
+                didx++;
+            }
+        }
+    }
+
+    detail->deduct_cnt = didx;
+
+    /* 6. 합계 */
+    detail->gross_pay = detail->allow_total;
+    detail->total_deduct = 0;
+    {
+        int k;
+        for (k = 0; k < detail->deduct_cnt; k++) {
+            detail->total_deduct += detail->deductions[k].amount;
+        }
+    }
+    detail->net_pay = detail->gross_pay - detail->total_deduct;
+
+    /* 실수령액이 음수인 경우 (공제가 총지급보다 큰 경우) */
+    if (detail->net_pay < 0) {
+        PAY_LOG_WARN("Negative net pay: emp=%s gross=%.0f deduct=%.0f net=%.0f", emp->emp_no, detail->gross_pay, detail->total_deduct, detail->net_pay);
+    }
+
+    detail->status = 'N';  /* 미확정 */
+
+    return PAY_SUCCESS;
+}
+
+/*******************************************************************************
+ * pay_batch_process - 급여 배치 처리
+ *
+ * 해당 급여년월의 모든 재직 사원에 대해 급여 산출
+ ******************************************************************************/
+int pay_batch_process(const char *pay_ym, BATCH_RESULT *result)
+{
+    EMP_INFO emp;
+    PAY_DETAIL detail;
+    int rc;
+    char log_buf[256];
+
+    PAY_CHECK_NULL(pay_ym);
+    PAY_CHECK_NULL(result);
+
+    memset(result, 0, sizeof(BATCH_RESULT));
+
+    /* 이미 확정된 급여 체크 */
+    if (check_already_processed(pay_ym) > 0) {
+        PAY_LOG_ERROR("Pay period %s already confirmed", pay_ym);
+        return PAY_ERR_ALREADY_DONE;
+    }
+
+    PAY_STRCPY(h_pay_ym, pay_ym, sizeof(h_pay_ym));
+
+    PAY_LOG_INFO("=== Pay batch started: %s ===", pay_ym);
+
+    /* 기존 미확정 데이터 삭제 */
+    EXEC SQL DELETE FROM TB_PAY_DETAIL
+        WHERE PAY_YM = :h_pay_ym AND STATUS = 'N';
+    EXEC SQL COMMIT;
+
+    /* 재직 사원 커서 */
+    EXEC SQL DECLARE cur_emp CURSOR FOR
+        SELECT EMP_NO
+        FROM   TB_PAY_EMPLOYEE
+        WHERE  ACTIVE_YN = 'Y'
+        AND    (RESIGN_DATE IS NULL OR RESIGN_DATE >= TO_DATE(:h_pay_ym || '01', 'YYYYMMDD'))
+        ORDER BY EMP_NO;
+
+    EXEC SQL OPEN cur_emp;
+    if (sqlca.sqlcode != 0) {
+        PAY_LOG_ERROR("Failed to open employee cursor");
+        return PAY_ERR_DB;
+    }
+
+    g_commit_count = 0;
+
+    while (1) {
+        EXEC SQL FETCH cur_emp INTO :h_emp_no;
+        if (sqlca.sqlcode == 1403) break;
+        if (sqlca.sqlcode != 0) {
+            PAY_LOG_ERROR("Fetch error: sqlcode=%ld", sqlca.sqlcode);
+            break;
+        }
+
+        result->total_cnt++;
+
+        /* 사원 정보 로드 */
+        rc = load_employee(h_emp_no, &emp);
+        if (rc != PAY_SUCCESS) {
+            result->fail_cnt++;
+            PAY_LOG_ERROR("Load employee failed: %s rc=%d", h_emp_no, rc);
+            continue;
+        }
+
+        /* 급여 계산 */
+        rc = process_single_employee(&emp, pay_ym, &detail);
+        if (rc != PAY_SUCCESS) {
+            result->fail_cnt++;
+            PAY_LOG_ERROR("Process failed: %s rc=%d", h_emp_no, rc);
+            continue;
+        }
+
+        /* 저장 (pay_detail.pc) */
+        rc = pay_save_detail(&detail);
+        if (rc != PAY_SUCCESS) {
+            result->fail_cnt++;
+            PAY_LOG_ERROR("Save failed: %s rc=%d", h_emp_no, rc);
+            continue;
+        }
+
+        result->success_cnt++;
+        result->total_gross += detail.gross_pay;
+        result->total_deduct += detail.total_deduct;
+        result->total_net += detail.net_pay;
+
+        /* 커밋 단위 */
+        g_commit_count++;
+        if (g_commit_count >= COMMIT_UNIT) {
+            EXEC SQL COMMIT;
+            g_commit_count = 0;
+            sprintf(log_buf, "Committed at %d employees", result->total_cnt);
+            PAY_LOG_INFO("%s", log_buf);
+        }
+    }
+
+    /* 잔여 건 커밋 */
+    if (g_commit_count > 0) {
+        EXEC SQL COMMIT;
+    }
+
+    EXEC SQL CLOSE cur_emp;
+
+    PAY_LOG_INFO("=== Pay batch completed: total=%d success=%d fail=%d ===", result->total_cnt, result->success_cnt, result->fail_cnt);
+    PAY_LOG_INFO("Total gross=%.0f deduct=%.0f net=%.0f", result->total_gross, result->total_deduct, result->total_net);
+
+    return PAY_SUCCESS;
+}
+
+/*******************************************************************************
+ * pay_confirm_batch - 급여 확정 처리
+ ******************************************************************************/
+int pay_confirm_batch(const char *pay_ym, int *confirmed_cnt)
+{
+    PAY_CHECK_NULL(pay_ym);
+    PAY_CHECK_NULL(confirmed_cnt);
+
+    PAY_STRCPY(h_pay_ym, pay_ym, sizeof(h_pay_ym));
+
+    EXEC SQL UPDATE TB_PAY_DETAIL
+    SET    STATUS = 'C',
+           CALC_DATE = TO_CHAR(SYSDATE, 'YYYY-MM-DD')
+    WHERE  PAY_YM = :h_pay_ym
+    AND    STATUS = 'N';
+
+    if (sqlca.sqlcode != 0 && sqlca.sqlcode != 1403) {
+        PAY_LOG_ERROR("Confirm failed: sqlcode=%ld", sqlca.sqlcode);
+        EXEC SQL ROLLBACK;
+        return PAY_ERR_DB;
+    }
+
+    *confirmed_cnt = sqlca.sqlerrd[2];
+    EXEC SQL COMMIT;
+
+    PAY_LOG_INFO("Confirmed %d records for %s", *confirmed_cnt, pay_ym);
+    return PAY_SUCCESS;
+}
+
+/*******************************************************************************
+ * pay_select_detail - 급여 명세 조회
+ ******************************************************************************/
+int pay_select_detail(const char *emp_no, const char *pay_ym, PAY_DETAIL *detail)
+{
+    EMP_INFO emp;
+    int rc;
+
+    PAY_CHECK_NULL(emp_no);
+    PAY_CHECK_NULL(pay_ym);
+    PAY_CHECK_NULL(detail);
+
+    memset(detail, 0, sizeof(PAY_DETAIL));
+    PAY_STRCPY(detail->emp_no, emp_no, sizeof(detail->emp_no));
+    PAY_STRCPY(detail->pay_ym, pay_ym, sizeof(detail->pay_ym));
+
+    rc = load_employee(emp_no, &emp);
+    if (rc != PAY_SUCCESS) return rc;
+
+    /* 수당 로드 */
+    rc = pay_load_allowances(emp_no, pay_ym, detail->allowances, &detail->allow_cnt, &detail->allow_total);
+    if (rc != PAY_SUCCESS) return rc;
+
+    /* 공제 로드 */
+    rc = pay_load_deductions(emp_no, pay_ym, detail->deductions, &detail->deduct_cnt, &detail->deduct_total);
+    if (rc != PAY_SUCCESS) return rc;
+
+    /* 합계 재계산 */
+    detail->gross_pay = detail->allow_total;
+    detail->total_deduct = detail->deduct_total;
+    detail->net_pay = detail->gross_pay - detail->total_deduct;
+
+    return PAY_SUCCESS;
+}
+
+/*******************************************************************************
+ * main
+ ******************************************************************************/
+int main(int argc, char *argv[])
+{
+    BATCH_RESULT batch_result;
+    PAY_DETAIL detail;
+    int rc, cnt;
+    char *db_user = "PAY_USER";
+    char *db_pass = "PAY_PASS";
+    char *db_name = "PAYDB";
+
+    rc = pay_db_connect(db_user, db_pass, db_name);
+    if (rc != PAY_SUCCESS) {
+        fprintf(stderr, "DB connect failed\n");
+        return 1;
+    }
+
+    if (argc < 3) {
+        printf("Usage: %s <command> <pay_ym> [emp_no]\n", argv[0]);
+        printf("  batch   <pay_ym>          - Run payroll batch\n");
+        printf("  confirm <pay_ym>          - Confirm payroll\n");
+        printf("  detail  <pay_ym> <emp_no> - View pay detail\n");
+        printf("  slip    <pay_ym> <emp_no> - Print pay slip\n");
+        pay_db_disconnect();
+        return 0;
+    }
+
+    if (strcmp(argv[1], "batch") == 0) {
+        rc = pay_batch_process(argv[2], &batch_result);
+        if (rc == PAY_SUCCESS) {
+            printf("Batch completed: %d/%d processed. Net total: %.0f\n", batch_result.success_cnt, batch_result.total_cnt, batch_result.total_net);
+        } else {
+            printf("Batch failed: rc=%d\n", rc);
+        }
+    } else if (strcmp(argv[1], "confirm") == 0) {
+        rc = pay_confirm_batch(argv[2], &cnt);
+        printf("Confirmed: %d records (rc=%d)\n", cnt, rc);
+    } else if (strcmp(argv[1], "detail") == 0 && argc >= 4) {
+        rc = pay_select_detail(argv[3], argv[2], &detail);
+        if (rc == PAY_SUCCESS) {
+            printf("Gross: %.0f, Deduct: %.0f, Net: %.0f\n", detail.gross_pay, detail.total_deduct, detail.net_pay);
+        }
+    } else if (strcmp(argv[1], "slip") == 0 && argc >= 4) {
+        rc = pay_select_detail(argv[3], argv[2], &detail);
+        if (rc == PAY_SUCCESS) {
+            pay_generate_slip(&detail, stdout);
+        }
+    } else {
+        printf("Unknown command: %s\n", argv[1]);
+    }
+
+    pay_db_disconnect();
+    return 0;
+}
