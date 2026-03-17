@@ -1064,7 +1064,7 @@ _TOOL_PARAM_DEFAULTS: dict[str, dict[str, str]] = {
     "list_code_definition_names": {"path": "."},
     "read_file": {"path": ""},
     "execute_command": {"command": "echo 'no command specified'"},
-    "ask_followup_question": {"follow_up": "How would you like to proceed?"},
+    "ask_followup_question": {"follow_up": "How would you like to proceed?", "question": "How would you like to proceed?"},
 }
 
 
@@ -1145,15 +1145,22 @@ def repair_response(body: dict, req_tools: list[dict] | None = None) -> tuple[di
             elif isinstance(args_str, dict):
                 parsed_args = args_str
 
-            # 3. Block todo.md writes — model wastes turns on todo instead of coding
+            # 3. Block unproductive tool calls
             if isinstance(parsed_args, dict):
+                # Block todo.md writes
                 target_path = str(parsed_args.get("path", ""))
                 if "todo" in target_path.lower() and target_path.endswith(".md"):
-                    # Skip this tool call entirely — replace with attempt_completion
                     fn["name"] = "attempt_completion"
                     fn["arguments"] = json.dumps({"result": "Skipping todo.md — proceed to create actual code files."})
                     repaired = True
-                    logger.info(f"[{_ts()}] 🚫 blocked todo.md write → redirected to attempt_completion")
+                    logger.info(f"[{_ts()}] 🚫 blocked todo.md write")
+
+            # Block ask_followup_question during coding — just proceed
+            if clean_name == "ask_followup_question":
+                fn["name"] = "attempt_completion"
+                fn["arguments"] = json.dumps({"result": "Proceeding with file creation. Start with pom.xml or the next required file."})
+                repaired = True
+                logger.info(f"[{_ts()}] 🚫 blocked ask_followup_question → proceed with coding")
 
             # 4. Convert broken apply_diff to write_to_file when possible
             if clean_name == "apply_diff" and isinstance(parsed_args, dict):
