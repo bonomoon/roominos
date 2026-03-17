@@ -88,25 +88,53 @@ class Pipeline:
         return self.results
 
     def _analyze(self, source: str, source_path: str) -> StageResult:
-        chunks = self.budget.chunk_text(source, max_lines=200)
-        analyses = []
+        lines = source.split('\n')
+        total_lines = len(lines)
         tokens = 0
 
-        for i, chunk in enumerate(chunks):
+        # For large files: send summary instead of all chunks
+        # Budget: analyze should use max 20% of total token budget
+        max_analyze_tokens = self.budget.max_tokens // 5  # ~4800 tokens
+
+        if total_lines > 500:
+            # Large file strategy: send first 150 + last 100 lines + function signatures
+            head = '\n'.join(lines[:150])
+            tail = '\n'.join(lines[-100:])
+            # Extract function signatures (lines with function-like patterns)
+            sigs = [l.strip() for l in lines if ('(' in l and ')' in l and '{' in l) or l.strip().startswith('EXEC SQL')]
+            sig_text = '\n'.join(sigs[:50])
+
             system = self.template.analyze_system() if self.template else "You are a code analyst."
-            # Inject learnings from memory
             learnings = self.memory.get_learnings()
             if learnings:
                 system = system + "\n\n" + learnings
-            prompt = f"Analyze this code (part {i+1}/{len(chunks)}):\n\n{chunk}\n\nList: functions, SQL statements, global variables, error handling patterns."
+
+            prompt = (
+                f"Analyze this {total_lines}-line Pro*C file. I'm showing key parts:\n\n"
+                f"=== FIRST 150 LINES ===\n{head}\n\n"
+                f"=== LAST 100 LINES ===\n{tail}\n\n"
+                f"=== FUNCTION SIGNATURES & SQL ({len(sigs)} found) ===\n{sig_text}\n\n"
+                f"List concisely: all functions, all EXEC SQL statements, all tables, error handling patterns, global variables."
+            )
             resp = self.llm.ask(prompt, system=system)
-            analyses.append(resp.content)
-            tokens += resp.tokens_used
+            tokens = resp.tokens_used
+            summary = resp.content
+        else:
+            # Small file: analyze fully (existing behavior)
+            chunks = self.budget.chunk_text(source, max_lines=200)
+            analyses = []
+            for i, chunk in enumerate(chunks):
+                system = self.template.analyze_system() if self.template else "You are a code analyst."
+                learnings = self.memory.get_learnings()
+                if learnings:
+                    system = system + "\n\n" + learnings
+                prompt = f"Analyze this code (part {i+1}/{len(chunks)}):\n\n{chunk}\n\nList: functions, SQL statements, global variables, error handling patterns."
+                resp = self.llm.ask(prompt, system=system)
+                analyses.append(resp.content)
+                tokens += resp.tokens_used
+            summary = self.budget.summarize("\n\n".join(analyses))
 
-        combined = "\n\n".join(analyses)
-        summary = self.budget.summarize(combined)
         self.total_tokens += tokens
-
         return StageResult(stage="analyze", success=True, output=summary, tokens_used=tokens)
 
     def _plan(self, analysis: str) -> StageResult:
