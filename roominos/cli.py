@@ -19,6 +19,7 @@ def main():
     migrate.add_argument("--api-base", default=os.environ.get("ROOMINOS_API_BASE", "https://openrouter.ai/api/v1"))
     migrate.add_argument("--api-key", default=os.environ.get("ROOMINOS_API_KEY", os.environ.get("OPENAI_API_KEY", "")))
     migrate.add_argument("--max-tokens", type=int, default=3000)
+    migrate.add_argument("--skill", default="migration", choices=["migration", "greenfield", "refactor", "test-gen", "review"])
 
     # generate command
     gen = sub.add_parser("generate", help="Generate code from template")
@@ -52,11 +53,11 @@ def run_migrate(args):
     with open(args.source) as f:
         source = f.read()
 
-    from .templates.migration import MigrationTemplate
+    from .templates.registry import get_skill
 
     llm = LLMClient(api_base=args.api_base, api_key=args.api_key, model=args.model, max_tokens=args.max_tokens)
-    template = MigrationTemplate(target_stack="Spring Boot 3.2, JDK 17, Spring Data JPA, Oracle")
-    pipeline = Pipeline(llm=llm, output_dir=args.output, template=template)
+    skill = get_skill(args.skill)
+    pipeline = Pipeline(llm=llm, output_dir=args.output, template=skill)
 
     start = time.time()
     results = pipeline.run(source, source_path=args.source)

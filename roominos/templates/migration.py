@@ -1,8 +1,12 @@
 """Migration template — Pro*C to Java/Spring domain-specific prompts."""
+from .base import BaseSkill
 
 
-class MigrationTemplate:
+class MigrationTemplate(BaseSkill):
     """Injects domain-specific prompts for Pro*C → Java/Spring migration."""
+
+    name = "migration"
+    description = "Migrate Pro*C legacy code to Spring Boot Java"
 
     def __init__(self, target_stack: str = "Spring Boot 3.2, JDK 17, Spring Data JPA, Oracle"):
         self.target_stack = target_stack
@@ -49,4 +53,10 @@ class MigrationTemplate:
             "Service uses constructor injection",
             "@Transactional on service methods",
             "Test class exists with @SpringBootTest",
+        ]
+
+    def mandatory_files(self) -> list[dict]:
+        return [
+            {"path": "src/main/resources/application.yml", "description": "Spring config, NO hardcoded dialect", "type": "config"},
+            {"path": "src/test/resources/application-test.yml", "description": "H2 test config", "type": "config"},
         ]

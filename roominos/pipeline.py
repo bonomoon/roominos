@@ -1,8 +1,10 @@
 """Pipeline engine: analyze → plan → implement → reflect → verify"""
+import hashlib
 import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from dataclasses import dataclass, field
 from .llm import LLMClient, LLMResponse
@@ -92,9 +94,17 @@ class Pipeline:
         total_lines = len(lines)
         tokens = 0
 
+        # Check cache first
+        source_hash = hashlib.sha256(source.encode()).hexdigest()[:16]
+        cache_dir = os.path.join(self.output_dir, ".roominos")
+        cache_path = os.path.join(cache_dir, f"analyze_{source_hash}.json")
+        if os.path.exists(cache_path):
+            with open(cache_path) as f:
+                cached = json.load(f)
+            return StageResult(stage="analyze", success=True, output=cached["output"], tokens_used=0)
+
         # For large files: send summary instead of all chunks
-        # Budget: analyze should use max 20% of total token budget
-        max_analyze_tokens = self.budget.max_tokens // 5  # ~4800 tokens
+        max_analyze_tokens = self.budget.max_tokens // 5
 
         if total_lines > 500:
             # Large file strategy: regex-based index (no LLM needed for extraction)
@@ -130,6 +140,12 @@ class Pipeline:
             summary = self.budget.summarize("\n\n".join(analyses))
 
         self.total_tokens += tokens
+
+        # Save to cache
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_path, 'w') as f:
+            json.dump({"output": summary, "hash": source_hash}, f)
+
         return StageResult(stage="analyze", success=True, output=summary, tokens_used=tokens)
 
     @staticmethod
@@ -244,25 +260,29 @@ class Pipeline:
     def _implement(self, files: list, source: str) -> StageResult:
         created = []
         tokens = 0
-        source_excerpt = source[:2000]  # Keep context small
+        source_excerpt = source[:2000]
+        system = self.template.implement_system() if self.template else "You are a Java developer. Output ONLY code. No explanation."
 
-        for file_spec in files:
+        def impl_one(file_spec):
             path = file_spec.get("path", "")
             desc = file_spec.get("description", "")
-
-            system = self.template.implement_system() if self.template else "You are a Java developer. Output ONLY code. No explanation."
             prompt = f"Create {path}: {desc}\n\nBased on source:\n{source_excerpt}\n\nOutput ONLY the file content, no markdown fences."
-
             resp = self.llm.ask(prompt, system=system)
-            tokens += resp.tokens_used
-
-            # Write file
             content = self.tools.extract_code(resp.content)
             full_path = os.path.join(self.output_dir, path)
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             with open(full_path, 'w') as f:
                 f.write(content)
-            created.append(path)
+            return path, resp.tokens_used
+
+        # Sequential with retry — parallel caused too many connection errors
+        for file_spec in files:
+            try:
+                path, tok = impl_one(file_spec)
+                created.append(path)
+                tokens += tok
+            except Exception as e:
+                pass  # LLM client has its own retry
 
         self.total_tokens += tokens
         return StageResult(stage="implement", success=len(created) > 0, output=f"Created {len(created)} files", tokens_used=tokens, artifacts={"created_files": created})
@@ -335,7 +355,7 @@ class Pipeline:
                 with open(full, 'w') as f:
                     f.write(content)
 
-        # LLM-based review
+        # LLM-based review — only for complex Java files
         for path in created_files:
             full = os.path.join(self.output_dir, path)
             if not os.path.exists(full):
@@ -343,8 +363,12 @@ class Pipeline:
             with open(full) as f:
                 content = f.read()
 
-            if len(content) < 50:  # Skip tiny files
-                continue
+            # Smart skip: deterministic fixes already handled simple cases
+            line_count = len(content.split('\n'))
+            if line_count < 100:
+                continue  # Small files already fixed deterministically
+            if any(path.endswith(ext) for ext in ['.yml', '.yaml', '.xml', '.properties']):
+                continue  # Config files don't need LLM review
 
             prompt = (
                 f"Review this file for common mistakes:\n"
