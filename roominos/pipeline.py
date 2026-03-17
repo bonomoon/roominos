@@ -97,12 +97,8 @@ class Pipeline:
         max_analyze_tokens = self.budget.max_tokens // 5  # ~4800 tokens
 
         if total_lines > 500:
-            # Large file strategy: send first 150 + last 100 lines + function signatures
-            head = '\n'.join(lines[:150])
-            tail = '\n'.join(lines[-100:])
-            # Extract function signatures (lines with function-like patterns)
-            sigs = [l.strip() for l in lines if ('(' in l and ')' in l and '{' in l) or l.strip().startswith('EXEC SQL')]
-            sig_text = '\n'.join(sigs[:50])
+            # Large file strategy: regex-based index (no LLM needed for extraction)
+            index = self._build_file_index(lines)
 
             system = self.template.analyze_system() if self.template else "You are a code analyst."
             learnings = self.memory.get_learnings()
@@ -110,11 +106,10 @@ class Pipeline:
                 system = system + "\n\n" + learnings
 
             prompt = (
-                f"Analyze this {total_lines}-line Pro*C file. I'm showing key parts:\n\n"
-                f"=== FIRST 150 LINES ===\n{head}\n\n"
-                f"=== LAST 100 LINES ===\n{tail}\n\n"
-                f"=== FUNCTION SIGNATURES & SQL ({len(sigs)} found) ===\n{sig_text}\n\n"
-                f"List concisely: all functions, all EXEC SQL statements, all tables, error handling patterns, global variables."
+                f"Analyze this {total_lines}-line C/Pro*C file based on its structural index:\n\n"
+                f"{index}\n\n"
+                f"List concisely: all functions (with purpose), all tables accessed, "
+                f"all cursor names, error handling strategy, key data types, and cross-file dependencies (#include)."
             )
             resp = self.llm.ask(prompt, system=system)
             tokens = resp.tokens_used
@@ -136,6 +131,87 @@ class Pipeline:
 
         self.total_tokens += tokens
         return StageResult(stage="analyze", success=True, output=summary, tokens_used=tokens)
+
+    @staticmethod
+    def _build_file_index(lines: list[str]) -> str:
+        """Build a structural index of a C/Pro*C file using regex — no LLM needed."""
+        import re
+
+        includes = []
+        functions = []
+        sql_stmts = []
+        cursors = []
+        structs = []
+        globals_sec = []
+        gotos = []
+        tables = set()
+
+        in_declare = False
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+
+            # Includes
+            if stripped.startswith('#include'):
+                includes.append(f"  L{i}: {stripped}")
+
+            # Function definitions (C-style: type name(...) { )
+            if re.match(r'^(?:static\s+)?(?:int|void|char|double|long|float|short)\s+\w+\s*\(', stripped):
+                functions.append(f"  L{i}: {stripped[:100]}")
+
+            # EXEC SQL
+            if 'EXEC SQL' in stripped.upper():
+                sql_stmts.append(f"  L{i}: {stripped[:100]}")
+                # Extract table names from FROM/INTO/UPDATE/INSERT
+                for m in re.finditer(r'(?:FROM|INTO|UPDATE|INSERT\s+INTO)\s+(\w+)', stripped, re.IGNORECASE):
+                    tables.add(m.group(1))
+
+            # Cursors
+            if 'DECLARE' in stripped.upper() and 'CURSOR' in stripped.upper():
+                cursors.append(f"  L{i}: {stripped[:100]}")
+
+            # Structs
+            if 'typedef struct' in stripped or (stripped.startswith('struct ') and '{' in stripped):
+                structs.append(f"  L{i}: {stripped[:100]}")
+
+            # GOTO labels
+            if re.match(r'^[A-Z_]+\s*:', stripped) and 'case' not in stripped.lower():
+                gotos.append(f"  L{i}: {stripped[:60]}")
+
+            # Global declare section
+            if 'BEGIN DECLARE' in stripped.upper():
+                in_declare = True
+            if 'END DECLARE' in stripped.upper():
+                in_declare = False
+            if in_declare and ':' not in stripped and stripped and not stripped.startswith('EXEC') and not stripped.startswith('/*'):
+                globals_sec.append(f"  L{i}: {stripped[:80]}")
+
+        parts = [f"=== FILE INDEX ({len(lines)} lines) ==="]
+        if includes:
+            parts.append(f"\n## Includes ({len(includes)})")
+            parts.extend(includes[:20])
+        if functions:
+            parts.append(f"\n## Functions ({len(functions)})")
+            parts.extend(functions[:30])
+        if sql_stmts:
+            parts.append(f"\n## EXEC SQL ({len(sql_stmts)})")
+            parts.extend(sql_stmts[:30])
+        if cursors:
+            parts.append(f"\n## Cursors ({len(cursors)})")
+            parts.extend(cursors)
+        if tables:
+            parts.append(f"\n## Tables ({len(tables)})")
+            parts.extend(f"  {t}" for t in sorted(tables))
+        if structs:
+            parts.append(f"\n## Structs ({len(structs)})")
+            parts.extend(structs)
+        if gotos:
+            parts.append(f"\n## GOTO Labels ({len(gotos)})")
+            parts.extend(gotos[:15])
+        if globals_sec:
+            parts.append(f"\n## Global Variables ({len(globals_sec)})")
+            parts.extend(globals_sec[:20])
+
+        return "\n".join(parts)
 
     def _plan(self, analysis: str) -> StageResult:
         system = self.template.plan_system() if self.template else "You are a software architect."
