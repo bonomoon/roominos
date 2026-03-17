@@ -125,6 +125,16 @@ class Pipeline:
         except (json.JSONDecodeError, AttributeError):
             pass
 
+        # Ensure mandatory files are always in the plan
+        existing_paths = {f.get("path", "") for f in files}
+        mandatory = [
+            {"path": "src/main/resources/application.yml", "description": "Spring config for Oracle datasource, NO hardcoded dialect", "type": "config"},
+            {"path": "src/test/resources/application-test.yml", "description": "Test config with H2 in-memory DB, ddl-auto=create-drop", "type": "config"},
+        ]
+        for m in mandatory:
+            if not any(m["path"] in p for p in existing_paths):
+                files.append(m)
+
         return StageResult(stage="plan", success=len(files) > 0, output=resp.content, tokens_used=resp.tokens_used, artifacts={"files": files})
 
     def _implement(self, files: list, source: str) -> StageResult:
@@ -158,6 +168,35 @@ class Pipeline:
         issues_found = 0
         tokens = 0
 
+        # Deterministic fixes first (no LLM call needed)
+        for path in created_files:
+            full = os.path.join(self.output_dir, path)
+            if not os.path.exists(full):
+                continue
+            with open(full) as f:
+                content = f.read()
+
+            changed = False
+            # Remove hardcoded Hibernate dialect lines
+            if "dialect" in content.lower() and ("Oracle" in content or "hibernate.dialect" in content):
+                lines = content.split("\n")
+                new_lines = [l for l in lines if "hibernate.dialect" not in l.lower() and "Oracle12cDialect" not in l and "OracleDialect" not in l]
+                if len(new_lines) < len(lines):
+                    content = "\n".join(new_lines)
+                    changed = True
+                    issues_found += 1
+
+            # Fix javax → jakarta
+            if "javax.persistence" in content:
+                content = content.replace("javax.persistence", "jakarta.persistence")
+                changed = True
+                issues_found += 1
+
+            if changed:
+                with open(full, 'w') as f:
+                    f.write(content)
+
+        # LLM-based review
         for path in created_files:
             full = os.path.join(self.output_dir, path)
             if not os.path.exists(full):
