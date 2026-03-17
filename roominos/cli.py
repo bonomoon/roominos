@@ -52,8 +52,11 @@ def run_migrate(args):
     with open(args.source) as f:
         source = f.read()
 
+    from .templates.migration import MigrationTemplate
+
     llm = LLMClient(api_base=args.api_base, api_key=args.api_key, model=args.model, max_tokens=args.max_tokens)
-    pipeline = Pipeline(llm=llm, output_dir=args.output)
+    template = MigrationTemplate(target_stack="Spring Boot 3.2, JDK 17, Spring Data JPA, Oracle")
+    pipeline = Pipeline(llm=llm, output_dir=args.output, template=template)
 
     start = time.time()
     results = pipeline.run(source, source_path=args.source)
