@@ -275,14 +275,16 @@ class Pipeline:
                 f.write(content)
             return path, resp.tokens_used
 
-        # Sequential with retry — parallel caused too many connection errors
-        for file_spec in files:
-            try:
-                path, tok = impl_one(file_spec)
-                created.append(path)
-                tokens += tok
-            except Exception as e:
-                pass  # LLM client has its own retry
+        # Parallel execution — unlimited API, 4 concurrent calls
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(impl_one, f): f for f in files}
+            for future in as_completed(futures):
+                try:
+                    path, tok = future.result()
+                    created.append(path)
+                    tokens += tok
+                except Exception:
+                    pass  # LLM client has retry built in
 
         self.total_tokens += tokens
         return StageResult(stage="implement", success=len(created) > 0, output=f"Created {len(created)} files", tokens_used=tokens, artifacts={"created_files": created})
